@@ -45,9 +45,17 @@ SEED_CARDS = [
 ]
 
 
+#: Формат меток из контракта: 2026-08-26T12:00:00Z — ISO 8601 UTC, без дробной секунды.
+TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+
 def utcnow() -> str:
-    """ISO 8601 UTC с 'Z' — как требует контракт."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    """Текущее время в формате меток контракта.
+
+    Секундной точности достаточно: сортировки, где метки могут совпасть
+    (список комментариев), дополнительно упорядочены по id.
+    """
+    return datetime.now(timezone.utc).strftime(TS_FORMAT)
 
 
 class Storage:

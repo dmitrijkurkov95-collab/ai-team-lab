@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 
 import pytest
@@ -283,3 +284,66 @@ def test_all_422_paths_use_string_detail(client, method, path, body):
 def test_404_detail_is_a_string_too(client):
     """404 уже был строкой — проверяем, что обработчик 422 его не сломал."""
     assert isinstance(client.get(f"{API}/cards/99999").json()["detail"], str)
+
+
+# ----------------------------------------------------- формат меток (контракт)
+
+TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
+
+def test_card_timestamps_match_contract_example(client):
+    """Контракт: «2026-08-26T12:00:00Z» — без дробной секунды.
+
+    Расхождение нашёл Agent-3 контракт-сьютом (xfail в PR #10).
+    """
+    card = make_card(client, title="метки времени")
+    for field in ("created_at", "updated_at"):
+        assert TS_RE.match(card[field]), f"{field}={card[field]!r}"
+
+
+def test_comment_timestamp_matches_contract(client):
+    card = make_card(client, title="метка комментария")
+    comment = client.post(f"{API}/cards/{card['id']}/comments", json={"text": "раз"}).json()
+    assert TS_RE.match(comment["created_at"]), comment["created_at"]
+
+
+def test_timestamps_stay_clean_after_patch(client):
+    card = make_card(client, title="после патча")
+    updated = client.patch(f"{API}/cards/{card['id']}", json={"status": "done"}).json()
+    assert TS_RE.match(updated["updated_at"]) and TS_RE.match(updated["created_at"])
+
+
+def test_legacy_rows_with_microseconds_are_normalised(tmp_path):
+    """Старые базы хранят метки с микросекундами — на выдаче формат всё равно чистый.
+
+    Мигрировать существующие БД ради формата вывода незачем, поэтому нормализация
+    стоит на границе API.
+    """
+    db = str(tmp_path / "legacy.db")
+    store = Storage(db)
+    store._conn.execute(  # noqa: SLF001 — намеренно пишем «старый» формат
+        "INSERT INTO cards (title, description, status, priority, created_at, updated_at)"
+        " VALUES (?,?,?,?,?,?)",
+        ("старая запись", "", "backlog", "normal",
+         "2026-08-26T12:00:00.742000Z", "2026-08-26T12:30:05.123456Z"),
+    )
+    store._conn.commit()  # noqa: SLF001
+
+    app.dependency_overrides[get_storage] = lambda: store
+    with TestClient(app) as c:
+        card = c.get(f"{API}/cards").json()[0]
+    app.dependency_overrides.clear()
+    store.close()
+
+    assert card["created_at"] == "2026-08-26T12:00:00Z"
+    assert card["updated_at"] == "2026-08-26T12:30:05Z"
+
+
+def test_comments_order_stable_within_same_second(client):
+    """Метки округлены до секунды — порядок держим по id, иначе список «поедет»."""
+    card = make_card(client, title="порядок комментариев")
+    texts = [f"комментарий {i}" for i in range(6)]
+    for t in texts:
+        client.post(f"{API}/cards/{card['id']}/comments", json={"text": t})
+    listed = [c["text"] for c in client.get(f"{API}/cards/{card['id']}/comments").json()]
+    assert listed == texts
