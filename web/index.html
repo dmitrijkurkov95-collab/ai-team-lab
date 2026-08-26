@@ -67,6 +67,29 @@
 
   .status-line { font-size: 13px; color: var(--muted); }
 
+  /* --- индикатор синхронизации: заметный, но не навязчивый --- */
+  .sync {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 13px;
+    color: var(--muted);
+    padding: 4px 10px;
+    border-radius: 12px;
+    background: var(--bg);
+  }
+  .sync-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #00875a;
+    flex: none;
+  }
+  .sync[data-state="syncing"] .sync-dot { background: var(--accent); animation: pulse 1s ease-in-out infinite; }
+  .sync[data-state="pending"] { background: #fffae6; color: #974f0c; }
+  .sync[data-state="pending"] .sync-dot { background: #ff991f; }
+  @keyframes pulse { 50% { opacity: .3; } }
+
   /* --- полоса уведомлений: ошибки API не должны исчезать молча --- */
   #toasts {
     position: fixed;
@@ -228,6 +251,11 @@
   <button class="primary" id="btn-new">+ Карточка</button>
   <button id="btn-refresh">Обновить</button>
   <div class="spacer"></div>
+  <div class="sync" id="sync-indicator" data-state="synced">
+    <span class="sync-dot" aria-hidden="true"></span>
+    <span id="sync-label">всё сохранено</span>
+    <button class="ghost" id="btn-retry" hidden>Повторить</button>
+  </div>
   <span class="status-line" id="status-line">загрузка…</span>
 </header>
 
