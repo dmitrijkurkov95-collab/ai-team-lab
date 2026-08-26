@@ -87,6 +87,11 @@ async function request(path, { method = 'GET', body } = {}) {
 
   if (response.status === 204) return null;
 
+  // X-Total-Count: сколько записей попадает под фильтр без учёта limit.
+  // Нужен, чтобы клиент видел неполную выдачу, а не считал её полной.
+  const totalHeader = response.headers.get('X-Total-Count');
+  const total = totalHeader === null ? null : Number(totalHeader);
+
   const text = await response.text();
   let payload = null;
   if (text) {
@@ -101,6 +106,13 @@ async function request(path, { method = 'GET', body } = {}) {
     const fallback = `Ошибка ${response.status}`;
     const message = formatDetail(payload && payload.detail, fallback);
     throw new ApiError(message, response.status, payload);
+  }
+
+  // Прикладываем счётчик к массивам: вызывающий код решает, что с ним делать.
+  // Свойство на массиве, а не обёртка {items, total}, — чтобы не переписывать
+  // всех потребителей ради заголовка, который нужен одному месту.
+  if (Array.isArray(payload) && total !== null && Number.isFinite(total)) {
+    Object.defineProperty(payload, 'totalCount', { value: total, enumerable: false });
   }
 
   return payload;
