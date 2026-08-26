@@ -326,3 +326,42 @@ def test_удаление_карточки_без_комментариев_не_
     assert "исчезнет" not in messages[-1], f"нечего терять — не пугаем: {messages[-1]}"
 
     page.request.delete(f"{WEB_URL}/api/v1/cards/{created['id']}")
+
+
+# ---------------------------------------------------------------- сверка с X-Total-Count (#21)
+
+def test_нормальная_загрузка_не_поднимает_ложную_тревогу(page):
+    """Полная выдача — молчим. Иначе предупреждение обесценится."""
+    assert page.locator("#toasts .toast.error").count() == 0
+    assert page.locator("article.card").count() >= 1
+
+
+def test_неполная_выдача_замечена_по_x_total_count(page):
+    """Сервер отдал 200 и неполный список — доска обязана сказать об этом.
+
+    Реальный сценарий из #21: при гонке в БД запрос завершается «успешно», но
+    часть карточек теряется. Ошибки нет, показывать нечего — молчаливая потеря
+    данных. Ловим по расхождению длины списка с заголовком X-Total-Count.
+    """
+    import json as _json
+
+    full = page.request.get(f"{WEB_URL}/api/v1/cards").json()
+    assert len(full) >= 3, "для теста нужно хотя бы 3 карточки на доске"
+
+    def truncate(route):
+        if route.request.method == "GET" and route.request.url.endswith("/cards"):
+            route.fulfill(
+                status=200,
+                content_type="application/json",
+                headers={"X-Total-Count": str(len(full)), "Access-Control-Allow-Origin": "*"},
+                body=_json.dumps(full[:2]),
+            )
+        else:
+            route.continue_()
+
+    page.route("**/api/v1/cards", truncate)
+    page.reload(wait_until="networkidle")
+    page.wait_for_timeout(1800)
+
+    toasts = page.locator("#toasts .toast.error").all_inner_texts()
+    assert any("получено" in t for t in toasts), f"предупреждение не показано: {toasts}"
