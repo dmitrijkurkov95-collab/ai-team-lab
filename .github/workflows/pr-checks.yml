@@ -1,0 +1,39 @@
+name: pr-checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  server-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r server/requirements.txt pytest httpx
+      - run: python -m pytest server -q
+
+  qa-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r server/requirements.txt -r tests/requirements.txt pytest
+      - run: |
+          cd server && nohup python run.py >/tmp/server.log 2>&1 &
+          sleep 5
+          cd .. && python -m pytest tests -q
+
+  web-syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m compileall -q web
