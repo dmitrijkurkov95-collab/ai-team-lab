@@ -118,12 +118,38 @@ def health(store: Storage = Depends(get_storage)) -> dict:
 # ---------------------------------------------------------------- карточки
 
 
+#: Потолок для явного ?limit= — защита от ?limit=100000.
+MAX_LIMIT = 200
+
+
 @app.get(f"{API_PREFIX}/cards", response_model=list[Card], tags=["cards"])
 def list_cards(
+    response: Response,
     status: Optional[Status] = Query(default=None, description="фильтр по колонке"),
+    priority: Optional[Priority] = Query(default=None, description="фильтр по приоритету"),
+    limit: Optional[int] = Query(
+        default=None,
+        ge=1,
+        le=MAX_LIMIT,
+        description=f"сколько карточек вернуть, 1…{MAX_LIMIT}; без параметра — все",
+    ),
     store: Storage = Depends(get_storage),
 ) -> list[dict]:
-    return store.list_cards(status.value if status else None)
+    """Список карточек. Фильтры комбинируются, лимит применяется после сортировки.
+
+    Урезание — только по явному запросу. Дефолтного лимита сознательно нет:
+    доска рисует все колонки разом, и молчаливое обрезание выдачи означало бы,
+    что интерфейс показывает неполную доску, не сообщая об этом. Ровно за это
+    я отказался молча обрезать limit>потолка — принцип должен работать и здесь.
+
+    Заголовок X-Total-Count отдаёт полное число карточек под фильтром, чтобы
+    клиент мог обнаружить урезание, не угадывая.
+    """
+    status_value = status.value if status else None
+    priority_value = priority.value if priority else None
+    total = store.count_cards(status=status_value, priority=priority_value)
+    response.headers["X-Total-Count"] = str(total)
+    return store.list_cards(status=status_value, priority=priority_value, limit=limit)
 
 
 @app.post(

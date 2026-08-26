@@ -91,14 +91,48 @@ class Storage:
 
     # ---------- карточки ----------
 
-    def list_cards(self, status: Optional[str] = None) -> list[dict[str, Any]]:
+    def list_cards(
+        self,
+        status: Optional[str] = None,
+        priority: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> list[dict[str, Any]]:
+        """Список карточек с опциональными фильтрами.
+
+        Лимит применяется после сортировки по id, чтобы «первые N» были
+        стабильны между запросами, а не зависели от порядка в файле БД.
+        """
         sql = "SELECT * FROM cards"
-        args: Iterable[Any] = ()
+        conditions: list[str] = []
+        args: list[Any] = []
         if status is not None:
-            sql += " WHERE status = ?"
-            args = (status,)
+            conditions.append("status = ?")
+            args.append(status)
+        if priority is not None:
+            conditions.append("priority = ?")
+            args.append(priority)
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
         sql += " ORDER BY id ASC"  # контракт: по возрастанию id
+        if limit is not None:
+            sql += " LIMIT ?"
+            args.append(limit)
         return [dict(r) for r in self._conn.execute(sql, args)]
+
+    def count_cards(self, status: Optional[str] = None, priority: Optional[str] = None) -> int:
+        """Сколько карточек попадает под фильтр — без учёта limit."""
+        sql = "SELECT COUNT(*) AS n FROM cards"
+        conditions: list[str] = []
+        args: list[Any] = []
+        if status is not None:
+            conditions.append("status = ?")
+            args.append(status)
+        if priority is not None:
+            conditions.append("priority = ?")
+            args.append(priority)
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        return int(self._conn.execute(sql, args).fetchone()["n"])
 
     def get_card(self, card_id: int) -> Optional[dict[str, Any]]:
         row = self._conn.execute("SELECT * FROM cards WHERE id = ?", (card_id,)).fetchone()
