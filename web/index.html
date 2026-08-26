@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Канбан-доска</title>
+<style>
+  :root {
+    --bg: #f4f5f7;
+    --column-bg: #ebecf0;
+    --card-bg: #ffffff;
+    --text: #172b4d;
+    --muted: #6b778c;
+    --border: #dfe1e6;
+    --accent: #0052cc;
+    --accent-soft: #e6effc;
+    --danger: #de350b;
+    --high: #ffebe6;
+    --high-text: #bf2600;
+    --normal: #deebff;
+    --normal-text: #0747a6;
+    --low: #e3fcef;
+    --low-text: #006644;
+    --radius: 6px;
+    --shadow: 0 1px 2px rgba(9, 30, 66, .18);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    color: var(--text);
+    background: var(--bg);
+  }
+
+  header.topbar {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 14px 20px;
+    background: #fff;
+    border-bottom: 1px solid var(--border);
+    flex-wrap: wrap;
+  }
+  header.topbar h1 { font-size: 18px; margin: 0; font-weight: 600; }
+  .spacer { flex: 1; }
+
+  button {
+    font: inherit;
+    cursor: pointer;
+    border-radius: var(--radius);
+    border: 1px solid transparent;
+    padding: 7px 14px;
+    background: var(--column-bg);
+    color: var(--text);
+    transition: background .12s ease;
+  }
+  button:hover { background: #dfe1e6; }
+  button.primary { background: var(--accent); color: #fff; }
+  button.primary:hover { background: #0747a6; }
+  button.ghost { background: transparent; color: var(--muted); padding: 4px 8px; }
+  button.ghost:hover { background: var(--column-bg); color: var(--text); }
+  button.danger { background: transparent; color: var(--danger); }
+  button.danger:hover { background: #ffebe6; }
+  button:disabled { opacity: .55; cursor: not-allowed; }
+
+  .status-line { font-size: 13px; color: var(--muted); }
+
+  /* --- полоса уведомлений: ошибки API не должны исчезать молча --- */
+  #toasts {
+    position: fixed;
+    right: 16px;
+    bottom: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    z-index: 50;
+    max-width: min(420px, calc(100vw - 32px));
+  }
+  .toast {
+    background: #fff;
+    border-left: 4px solid var(--accent);
+    border-radius: var(--radius);
+    box-shadow: 0 8px 16px rgba(9, 30, 66, .25);
+    padding: 10px 12px;
+    display: flex;
+    gap: 10px;
+    align-items: flex-start;
+  }
+  .toast.error { border-left-color: var(--danger); }
+  .toast.success { border-left-color: #00875a; }
+  .toast p { margin: 0; font-size: 13px; word-break: break-word; }
+  .toast strong { display: block; font-size: 13px; margin-bottom: 2px; }
+
+  /* --- доска --- */
+  main.board {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(240px, 1fr));
+    gap: 12px;
+    padding: 16px 20px 32px;
+    align-items: start;
+  }
+  @media (max-width: 900px) {
+    main.board { grid-template-columns: 1fr; }
+  }
+
+  section.column {
+    background: var(--column-bg);
+    border-radius: 8px;
+    padding: 8px;
+    min-height: 120px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  section.column.dragover {
+    outline: 2px dashed var(--accent);
+    outline-offset: -3px;
+    background: var(--accent-soft);
+  }
+  .column-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 6px;
+    font-weight: 600;
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: .4px;
+    color: var(--muted);
+  }
+  .count {
+    background: #fff;
+    border-radius: 10px;
+    padding: 1px 8px;
+    font-size: 12px;
+    color: var(--muted);
+    font-weight: 600;
+  }
+  .column-body { display: flex; flex-direction: column; gap: 8px; min-height: 40px; }
+  .empty-hint {
+    color: var(--muted);
+    font-size: 12px;
+    padding: 12px 8px;
+    text-align: center;
+    border: 1px dashed var(--border);
+    border-radius: var(--radius);
+  }
+
+  article.card {
+    background: var(--card-bg);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 10px 12px;
+    cursor: grab;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  article.card:active { cursor: grabbing; }
+  article.card.dragging { opacity: .45; }
+  article.card:focus-visible { outline: 2px solid var(--accent); }
+  .card-title { font-weight: 500; word-break: break-word; }
+  .card-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+  .badge {
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: .3px;
+    border-radius: 3px;
+    padding: 2px 7px;
+  }
+  .badge.high { background: var(--high); color: var(--high-text); }
+  .badge.normal { background: var(--normal); color: var(--normal-text); }
+  .badge.low { background: var(--low); color: var(--low-text); }
+  .card-id { font-size: 11px; color: var(--muted); }
+  .comment-chip { font-size: 11px; color: var(--muted); }
+
+  /* --- модальные окна --- */
+  dialog {
+    border: none;
+    border-radius: 8px;
+    padding: 0;
+    width: min(520px, calc(100vw - 32px));
+    box-shadow: 0 12px 32px rgba(9, 30, 66, .3);
+    color: var(--text);
+  }
+  dialog::backdrop { background: rgba(9, 30, 66, .5); }
+  .dialog-inner { padding: 20px; display: flex; flex-direction: column; gap: 14px; }
+  dialog h2 { margin: 0; font-size: 17px; }
+  label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); }
+  input[type="text"], textarea, select {
+    font: inherit;
+    color: var(--text);
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: #fff;
+    width: 100%;
+  }
+  input:focus, textarea:focus, select:focus { outline: 2px solid var(--accent); border-color: transparent; }
+  textarea { resize: vertical; min-height: 70px; }
+  .row { display: flex; gap: 12px; }
+  .row > * { flex: 1; }
+  .dialog-actions { display: flex; gap: 8px; justify-content: flex-end; align-items: center; }
+  .field-error { color: var(--danger); font-size: 12px; min-height: 16px; }
+
+  .comments { display: flex; flex-direction: column; gap: 8px; max-height: 220px; overflow-y: auto; }
+  .comment {
+    background: var(--bg);
+    border-radius: var(--radius);
+    padding: 8px 10px;
+    font-size: 13px;
+  }
+  .comment time { display: block; color: var(--muted); font-size: 11px; margin-top: 2px; }
+  .comment-form { display: flex; gap: 8px; }
+  .comment-form input { flex: 1; }
+  hr { border: none; border-top: 1px solid var(--border); margin: 0; }
+  .muted { color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <h1>Канбан-доска</h1>
+  <button class="primary" id="btn-new">+ Карточка</button>
+  <button id="btn-refresh">Обновить</button>
+  <div class="spacer"></div>
+  <span class="status-line" id="status-line">загрузка…</span>
+</header>
+
+<main class="board" id="board"></main>
+
+<!-- создание / редактирование карточки -->
+<dialog id="card-dialog">
+  <form class="dialog-inner" method="dialog" id="card-form">
+    <h2 id="card-dialog-title">Новая карточка</h2>
+    <label>Заголовок
+      <input type="text" id="f-title" maxlength="200" autocomplete="off" required>
+    </label>
+    <div class="field-error" id="f-title-error"></div>
+    <label>Описание
+      <textarea id="f-description"></textarea>
+    </label>
+    <div class="row">
+      <label>Статус
+        <select id="f-status">
+          <option value="backlog">Бэклог</option>
+          <option value="in_progress">В работе</option>
+          <option value="review">Ревью</option>
+          <option value="done">Готово</option>
+        </select>
+      </label>
+      <label>Приоритет
+        <select id="f-priority">
+          <option value="low">Низкий</option>
+          <option value="normal" selected>Обычный</option>
+          <option value="high">Высокий</option>
+        </select>
+      </label>
+    </div>
+    <div class="dialog-actions">
+      <button type="button" class="danger" id="btn-delete" hidden>Удалить</button>
+      <div class="spacer"></div>
+      <button type="button" id="btn-cancel">Отмена</button>
+      <button type="submit" class="primary" id="btn-save">Сохранить</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- карточка целиком: детали + комментарии -->
+<dialog id="detail-dialog">
+  <div class="dialog-inner">
+    <h2 id="d-title">Карточка</h2>
+    <div class="card-meta">
+      <span class="badge" id="d-priority">normal</span>
+      <span class="card-id" id="d-status"></span>
+      <span class="card-id" id="d-dates"></span>
+    </div>
+    <p class="muted" id="d-description"></p>
+    <hr>
+    <strong style="font-size:13px">Комментарии</strong>
+    <div class="comments" id="d-comments"></div>
+    <form class="comment-form" id="comment-form">
+      <input type="text" id="c-text" placeholder="Написать комментарий…" autocomplete="off">
+      <button type="submit" class="primary">Отправить</button>
+    </form>
+    <div class="dialog-actions">
+      <button type="button" id="btn-edit">Редактировать</button>
+      <button type="button" class="primary" id="btn-detail-close">Закрыть</button>
+    </div>
+  </div>
+</dialog>
+
+<div id="toasts"></div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>
