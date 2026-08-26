@@ -239,3 +239,47 @@ def test_seed_runs_once_and_fills_board(tmp_path):
 def test_health_endpoint(client):
     r = client.get(f"{API}/health")
     assert r.status_code == 200 and r.json()["status"] == "ok"
+
+
+# ------------------------------------------------------- формат ошибок (контракт)
+
+
+def test_422_detail_is_a_string(client):
+    """Контракт: detail — строка. FastAPI по умолчанию отдаёт массив объектов.
+
+    Регрессия, найденная Agent-2 при интеграции: клиенту приходилось разбирать
+    два разных формата ошибок.
+    """
+    r = client.post(f"{API}/cards", json={"title": ""})
+    assert r.status_code == 422
+    payload = r.json()
+    assert isinstance(payload["detail"], str), payload
+    assert "title" in payload["detail"]
+
+
+def test_422_keeps_machine_readable_errors(client):
+    """Человеческая строка не должна стоить нам подробностей для отладки."""
+    payload = client.post(f"{API}/cards", json={"title": "ok", "priority": "urgent"}).json()
+    assert isinstance(payload["errors"], list) and payload["errors"]
+    assert "priority" in payload["detail"]
+
+
+@pytest.mark.parametrize(
+    "method,path,body",
+    [
+        ("post", f"{API}/cards", {"title": "x" * 201}),
+        ("patch", f"{API}/cards/1", {"status": "archived"}),
+        ("post", f"{API}/cards/1/comments", {"text": "  "}),
+        ("get", f"{API}/cards?status=nope", None),
+    ],
+)
+def test_all_422_paths_use_string_detail(client, method, path, body):
+    make_card(client, title="цель для PATCH")
+    r = getattr(client, method)(path, **({"json": body} if body is not None else {}))
+    assert r.status_code == 422
+    assert isinstance(r.json()["detail"], str)
+
+
+def test_404_detail_is_a_string_too(client):
+    """404 уже был строкой — проверяем, что обработчик 422 его не сломал."""
+    assert isinstance(client.get(f"{API}/cards/99999").json()["detail"], str)

@@ -6,12 +6,15 @@
 
 from __future__ import annotations
 
+import json
 import os
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Response, status as http_status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status as http_status
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from .schemas import (
     Card,
@@ -63,6 +66,30 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _humanize(error: dict) -> str:
+    """Одна ошибка валидации Pydantic → короткая понятная фраза."""
+    loc = [str(p) for p in error.get("loc", []) if p not in ("body", "query", "path")]
+    field = ".".join(loc)
+    msg = error.get("msg", "invalid value")
+    # Pydantic префиксует пользовательские ValueError строкой "Value error, "
+    msg = msg.removeprefix("Value error, ")
+    return f"{field}: {msg}" if field else msg
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """Контракт обещает `detail` строкой — приводим 422 к тому же формату, что и 404.
+
+    По умолчанию FastAPI отдаёт `detail` массивом объектов, из-за чего клиенту
+    приходится разбирать два разных формата ошибок. Нашёл Agent-2 при интеграции.
+    Подробности не теряем: они уезжают в поле `errors` рядом.
+    """
+    errors = exc.errors()
+    detail = "; ".join(_humanize(e) for e in errors) or "Validation error"
+    safe_errors = json.loads(json.dumps(errors, default=str))  # ctx может быть несериализуем
+    return JSONResponse(status_code=422, content={"detail": detail, "errors": safe_errors})
 
 
 def _card_or_404(store: Storage, card_id: int) -> dict:
