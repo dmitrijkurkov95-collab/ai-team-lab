@@ -211,7 +211,7 @@ def test_при_обрыве_сети_правка_копится_а_не_тер
     target = next(s for s in ("done", "review", "in_progress", "backlog") if s != origin)
 
     page.evaluate(DRAG_SNIPPET, [card_id, target])
-    page.wait_for_timeout(1200)
+    page.wait_for_function("() => window.__kanban.queue.size === 1", timeout=10000)
 
     assert column_of(page, card_id) == target, "карточка должна остаться в новой колонке"
     assert page.get_attribute("#sync-indicator", "data-state") == "pending"
@@ -245,12 +245,15 @@ def test_после_возврата_сети_очередь_уходит_на_�
     origin = column_of(page, card_id)
     target = next(s for s in ("done", "review", "in_progress", "backlog") if s != origin)
     page.evaluate(DRAG_SNIPPET, [card_id, target])
-    page.wait_for_timeout(1000)
+    page.wait_for_function("() => window.__kanban.queue.size === 1", timeout=10000)
     assert _queue_size(page) == 1
 
     page.unroute("**/api/v1/cards/**")
     page.evaluate("() => window.__kanban.queue.flushNow()")
-    page.wait_for_timeout(1500)
+    # Ждём по условию, а не фиксированную паузу: отправка идёт по сети, и на
+    # загруженной машине 1.5 с иногда не хватало — тест падал раз в несколько
+    # прогонов, хотя код исправен.
+    page.wait_for_function("() => window.__kanban.queue.size === 0", timeout=10000)
 
     assert _queue_size(page) == 0
     assert page.get_attribute("#sync-indicator", "data-state") == "synced"
@@ -365,3 +368,36 @@ def test_неполная_выдача_замечена_по_x_total_count(page)
 
     toasts = page.locator("#toasts .toast.error").all_inner_texts()
     assert any("получено" in t for t in toasts), f"предупреждение не показано: {toasts}"
+
+
+def test_пустой_заголовок_total_count_не_считается_нулём(page):
+    """`X-Total-Count: ''` — отсутствие данных, а не ноль записей.
+
+    Замечание Agent-1 в ревью PR #24: `Number('')` даёт `0`, и на непустом
+    списке доска сказала бы «получено 6 при заявленных 0». Сервер такого не
+    отдаёт, но промежуточный прокси может.
+    """
+    import json as _json
+
+    full = page.request.get(f"{WEB_URL}/api/v1/cards").json()
+
+    def empty_header(route):
+        if route.request.method == "GET" and route.request.url.endswith("/cards"):
+            route.fulfill(
+                status=200,
+                content_type="application/json",
+                headers={"X-Total-Count": "", "Access-Control-Allow-Origin": "*"},
+                body=_json.dumps(full),
+            )
+        else:
+            route.continue_()
+
+    page.route("**/api/v1/cards", empty_header)
+    page.reload(wait_until="networkidle")
+    page.wait_for_timeout(1500)
+
+    toasts = page.locator("#toasts .toast.error").all_inner_texts()
+    assert not any("заявленных" in t or "получено" in t for t in toasts), (
+        f"пустой заголовок не должен поднимать тревогу: {toasts}"
+    )
+    assert page.locator("article.card").count() == len(full)
