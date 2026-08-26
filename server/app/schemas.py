@@ -2,11 +2,25 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
+
+#: Контракт: "2026-08-26T12:00:00Z" — ISO 8601 UTC без дробной секунды.
+TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def _serialize_ts(value: datetime) -> str:
+    """Гарантирует формат меток на границе API.
+
+    Нормализуем при отдаче, а не только при записи: в уже существующих базах
+    лежат строки с микросекундами, и мигрировать их ради формата вывода незачем.
+    """
+    if value.tzinfo is not None:
+        value = value.astimezone(timezone.utc)
+    return value.strftime(TS_FORMAT)
 
 
 class Status(str, Enum):
@@ -84,6 +98,10 @@ class Card(BaseModel):
     created_at: datetime
     updated_at: datetime
 
+    @field_serializer("created_at", "updated_at")
+    def serialize_ts(self, value: datetime, _info) -> str:
+        return _serialize_ts(value)
+
 
 class CommentCreate(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -104,3 +122,7 @@ class Comment(BaseModel):
     card_id: int
     text: str
     created_at: datetime
+
+    @field_serializer("created_at")
+    def serialize_ts(self, value: datetime, _info) -> str:
+        return _serialize_ts(value)
