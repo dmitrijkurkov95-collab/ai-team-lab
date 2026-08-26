@@ -229,6 +229,23 @@ async function loadBoard() {
   try {
     state.cards = await api.listCards();
     render();
+
+    // Сверяем полученное с X-Total-Count. При сбое на стороне БД сервер может
+    // отдать 200 и неполный список — без этой проверки доска молча покажет
+    // меньше карточек, чем есть, и пользователь ничего не заподозрит.
+    // Ошибки-то нет: ответ формально успешный.
+    const total = state.cards.totalCount;
+    if (typeof total === 'number' && total !== state.cards.length) {
+      const missing = total - state.cards.length;
+      toast(
+        missing > 0
+          ? `Сервер сообщает о ${total} карточках, получено ${state.cards.length}. Доска неполная — обновите страницу.`
+          : `Расхождение: получено ${state.cards.length} карточек при заявленных ${total}.`,
+        'error',
+        'Неполные данные',
+      );
+    }
+
     loadCommentCounts(); // не блокируем отрисовку доски
   } catch (error) {
     state.cards = [];
