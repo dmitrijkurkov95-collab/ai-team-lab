@@ -339,6 +339,102 @@ def test_legacy_rows_with_microseconds_are_normalised(tmp_path):
     assert card["updated_at"] == "2026-08-26T12:30:05Z"
 
 
+# --------------------------------------------- фильтры и лимит списка (#14)
+
+
+def test_filter_by_priority(client):
+    make_card(client, title="низкий", priority="low")
+    make_card(client, title="высокий-1", priority="high")
+    make_card(client, title="высокий-2", priority="high")
+    high = client.get(f"{API}/cards", params={"priority": "high"}).json()
+    assert len(high) == 2 and {c["priority"] for c in high} == {"high"}
+
+
+@pytest.mark.parametrize("priority", ["low", "normal", "high"])
+def test_filter_accepts_every_contract_priority(client, priority):
+    make_card(client, title=f"карточка {priority}", priority=priority)
+    got = client.get(f"{API}/cards", params={"priority": priority}).json()
+    assert all(c["priority"] == priority for c in got) and got
+
+
+def test_filter_by_unknown_priority_422(client):
+    assert client.get(f"{API}/cards", params={"priority": "urgent"}).status_code == 422
+
+
+def test_status_and_priority_combine(client):
+    make_card(client, title="цель", status="done", priority="high")
+    make_card(client, title="не та колонка", status="backlog", priority="high")
+    make_card(client, title="не тот приоритет", status="done", priority="low")
+    got = client.get(f"{API}/cards", params={"status": "done", "priority": "high"}).json()
+    assert [c["title"] for c in got] == ["цель"]
+
+
+def test_empty_filter_result_is_200_and_empty_list(client):
+    """Ничего не нашлось — это не ошибка."""
+    make_card(client, title="одна", priority="low")
+    r = client.get(f"{API}/cards", params={"priority": "high"})
+    assert r.status_code == 200 and r.json() == []
+
+
+def test_limit_returns_first_n_by_id(client):
+    for i in range(5):
+        make_card(client, title=f"карточка {i}")
+    got = client.get(f"{API}/cards", params={"limit": 3}).json()
+    ids = [c["id"] for c in got]
+    assert len(got) == 3 and ids == sorted(ids)
+
+
+def test_limit_larger_than_collection_is_fine(client):
+    make_card(client, title="единственная")
+    assert len(client.get(f"{API}/cards", params={"limit": 200}).json()) == 1
+
+
+def test_limit_combines_with_filters(client):
+    for i in range(4):
+        make_card(client, title=f"высокий {i}", priority="high", status="done")
+    make_card(client, title="лишняя", priority="low")
+    got = client.get(
+        f"{API}/cards", params={"priority": "high", "status": "done", "limit": 2}
+    ).json()
+    assert len(got) == 2 and all(c["priority"] == "high" for c in got)
+
+
+@pytest.mark.parametrize("limit", [0, -1, 201, 100000, "abc", ""])
+def test_invalid_limit_422(client, limit):
+    """Потолок — 422, а не молчаливое обрезание: клиент должен знать про урезание."""
+    assert client.get(f"{API}/cards", params={"limit": limit}).status_code == 422
+
+
+def test_limit_boundaries_are_inclusive(client):
+    make_card(client, title="границы")
+    assert client.get(f"{API}/cards", params={"limit": 1}).status_code == 200
+    assert client.get(f"{API}/cards", params={"limit": 200}).status_code == 200
+
+
+def test_no_default_limit_returns_everything(client):
+    """Без ?limit= отдаём всё: молчаливое обрезание доски — обман интерфейса."""
+    for i in range(55):
+        client.post(f"{API}/cards", json={"title": f"карточка {i}"})
+    assert len(client.get(f"{API}/cards").json()) == 55
+
+
+def test_total_count_header_reveals_truncation(client):
+    """X-Total-Count показывает полный размер выборки, даже когда limit урезал ответ."""
+    for i in range(10):
+        make_card(client, title=f"карточка {i}", priority="high")
+    r = client.get(f"{API}/cards", params={"limit": 3})
+    assert len(r.json()) == 3
+    assert r.headers["X-Total-Count"] == "10"
+
+
+def test_total_count_respects_filters(client):
+    make_card(client, title="высокая", priority="high")
+    make_card(client, title="низкая-1", priority="low")
+    make_card(client, title="низкая-2", priority="low")
+    r = client.get(f"{API}/cards", params={"priority": "low"})
+    assert r.headers["X-Total-Count"] == "2" and len(r.json()) == 2
+
+
 def test_comments_order_stable_within_same_second(client):
     """Метки округлены до секунды — порядок держим по id, иначе список «поедет»."""
     card = make_card(client, title="порядок комментариев")
