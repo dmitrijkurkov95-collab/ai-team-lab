@@ -15,6 +15,15 @@ const COLUMNS = [
 const PRIORITY_LABEL = { low: 'низкий', normal: 'обычный', high: 'высокий' };
 const STATUS_LABEL = Object.fromEntries(COLUMNS.map((c) => [c.status, c.label]));
 
+/**
+ * Лимит выдачи при загрузке доски. `null` — запрашиваем всё.
+ *
+ * Пока null, сверка с X-Total-Count корректна (см. loadBoard). Если появится
+ * пагинация — выставить значение здесь, и сверка автоматически отключится,
+ * а не начнёт врать.
+ */
+const LOAD_LIMIT = null;
+
 /** Единственный источник правды на клиенте. */
 const state = {
   cards: [],
@@ -227,14 +236,21 @@ function render() {
 async function loadBoard() {
   setStatusLine('загрузка…');
   try {
-    state.cards = await api.listCards();
+    state.cards = await api.listCards(null, LOAD_LIMIT ? { limit: LOAD_LIMIT } : {});
     render();
 
     // Сверяем полученное с X-Total-Count. При сбое на стороне БД сервер может
     // отдать 200 и неполный список — без этой проверки доска молча покажет
     // меньше карточек, чем есть, и пользователь ничего не заподозрит.
     // Ошибки-то нет: ответ формально успешный.
-    const total = state.cards.totalCount;
+    //
+    // ВАЖНО: сверка верна только пока запрашиваем без `limit`. По контракту
+    // X-Total-Count не учитывает лимит, поэтому при `?limit=N` расхождение
+    // штатно, и предупреждение начало бы врать на каждой загрузке.
+    // Замечание Agent-1 в ревью PR #24 — ловушка тихая: тесты остались бы
+    // зелёными. Здесь `limit` не передаётся, но условие фиксирует инвариант,
+    // чтобы будущая пагинация не сломала проверку молча.
+    const total = LOAD_LIMIT ? undefined : state.cards.totalCount;
     if (typeof total === 'number' && total !== state.cards.length) {
       const missing = total - state.cards.length;
       toast(

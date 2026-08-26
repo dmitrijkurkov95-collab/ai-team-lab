@@ -89,8 +89,10 @@ async function request(path, { method = 'GET', body } = {}) {
 
   // X-Total-Count: сколько записей попадает под фильтр без учёта limit.
   // Нужен, чтобы клиент видел неполную выдачу, а не считал её полной.
+  // Пустой заголовок (может вставить промежуточный прокси) — не ноль, а
+  // отсутствие данных: Number('') === 0, и доска решила бы, что записей нет.
   const totalHeader = response.headers.get('X-Total-Count');
-  const total = totalHeader === null ? null : Number(totalHeader);
+  const total = totalHeader === null || totalHeader.trim() === '' ? null : Number(totalHeader);
 
   const text = await response.text();
   let payload = null;
@@ -120,10 +122,20 @@ async function request(path, { method = 'GET', body } = {}) {
 
 // --- карточки ---------------------------------------------------------------
 
-/** Список карточек; пустой статус не отправляем — бэкенд ответит 422 на `?status=`. */
-export function listCards(status) {
-  const query = status ? `?status=${encodeURIComponent(status)}` : '';
-  return request(`/cards${query}`);
+/**
+ * Список карточек; пустой статус не отправляем — бэкенд ответит 422 на `?status=`.
+ *
+ * `limit` прокидывается наружу осознанно: по контракту `X-Total-Count` не
+ * учитывает лимит, поэтому потребитель должен знать, запрашивал ли он урезанную
+ * выдачу. Иначе сверка полноты данных начнёт врать (см. loadBoard).
+ */
+export function listCards(status, { limit, priority } = {}) {
+  const params = new URLSearchParams();
+  if (status) params.set('status', status);
+  if (priority) params.set('priority', priority);
+  if (limit) params.set('limit', String(limit));
+  const query = params.toString();
+  return request(`/cards${query ? `?${query}` : ''}`);
 }
 
 export function getCard(id) {
