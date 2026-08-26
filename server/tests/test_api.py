@@ -9,6 +9,8 @@ from __future__ import annotations
 import os
 import re
 import sys
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from fastapi.testclient import TestClient
@@ -237,9 +239,68 @@ def test_seed_runs_once_and_fills_board(tmp_path):
     store.close()
 
 
+def test_memory_db_is_rejected_with_clear_message(tmp_path):
+    """:memory: несовместим с соединением-на-запрос — падаем внятно, а не 'no such table'."""
+    with pytest.raises(ValueError, match="memory"):
+        Storage(":memory:")
+
+
 def test_health_endpoint(client):
     r = client.get(f"{API}/health")
     assert r.status_code == 200 and r.json()["status"] == "ok"
+
+
+# ------------------------------------------------- параллельный доступ (#21)
+#
+# Дыра в покрытии, из-за которой баг дожил до спринта 2: все остальные тесты
+# последовательные, а дефект проявляется только под конкурентной нагрузкой.
+# На общем sqlite3.Connection с check_same_thread=False эти тесты падают
+# с InterfaceError → 500.
+
+
+def test_parallel_reads_never_return_5xx(client):
+    """Доска грузит счётчики комментариев параллельно — это уронило сервер на стенде."""
+    cards = [make_card(client, title=f"параллель {i}") for i in range(6)]
+    for card in cards:
+        client.post(f"{API}/cards/{card['id']}/comments", json={"text": "раз"})
+
+    paths = [f"{API}/cards/{c['id']}/comments" for c in cards] * 15 + [f"{API}/cards"] * 15
+
+    with ThreadPoolExecutor(max_workers=32) as pool:
+        codes = list(pool.map(lambda p: client.get(p).status_code, paths))
+
+    assert not [c for c in codes if c >= 500], f"5xx под параллельной нагрузкой: {Counter(codes)}"
+    assert all(c == 200 for c in codes), Counter(codes)
+
+
+def test_parallel_writes_all_persist(client):
+    """Одновременные записи не должны терять данные и падать."""
+    def create(i: int) -> int:
+        return client.post(f"{API}/cards", json={"title": f"конкурент {i}"}).status_code
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        codes = list(pool.map(create, range(30)))
+
+    assert set(codes) == {201}, Counter(codes)
+    titles = {c["title"] for c in client.get(f"{API}/cards").json()}
+    assert all(f"конкурент {i}" in titles for i in range(30)), "часть записей потерялась"
+
+
+def test_parallel_mixed_load(client):
+    """Смешанная нагрузка: чтения, записи и обновления одновременно."""
+    card = make_card(client, title="под нагрузкой")
+
+    def work(i: int) -> int:
+        if i % 3 == 0:
+            return client.get(f"{API}/cards").status_code
+        if i % 3 == 1:
+            return client.post(f"{API}/cards/{card['id']}/comments", json={"text": f"к{i}"}).status_code
+        return client.patch(f"{API}/cards/{card['id']}", json={"status": "review"}).status_code
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        codes = list(pool.map(work, range(60)))
+
+    assert not [c for c in codes if c >= 500], Counter(codes)
 
 
 # ------------------------------------------------------- формат ошибок (контракт)
@@ -321,13 +382,13 @@ def test_legacy_rows_with_microseconds_are_normalised(tmp_path):
     """
     db = str(tmp_path / "legacy.db")
     store = Storage(db)
-    store._conn.execute(  # noqa: SLF001 — намеренно пишем «старый» формат
-        "INSERT INTO cards (title, description, status, priority, created_at, updated_at)"
-        " VALUES (?,?,?,?,?,?)",
-        ("старая запись", "", "backlog", "normal",
-         "2026-08-26T12:00:00.742000Z", "2026-08-26T12:30:05.123456Z"),
-    )
-    store._conn.commit()  # noqa: SLF001
+    with store._connect() as conn:  # noqa: SLF001 — намеренно пишем «старый» формат
+        conn.execute(
+            "INSERT INTO cards (title, description, status, priority, created_at, updated_at)"
+            " VALUES (?,?,?,?,?,?)",
+            ("старая запись", "", "backlog", "normal",
+             "2026-08-26T12:00:00.742000Z", "2026-08-26T12:30:05.123456Z"),
+        )
 
     app.dependency_overrides[get_storage] = lambda: store
     with TestClient(app) as c:
