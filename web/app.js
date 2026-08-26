@@ -3,6 +3,7 @@
  * здесь только состояние, рендер и события.
  */
 import api, { ApiError, BASE_URL } from './api.js';
+import { SyncQueue } from './sync.js';
 
 const COLUMNS = [
   { status: 'backlog', label: 'Бэклог' },
@@ -63,6 +64,49 @@ function reportError(error, context) {
 
 function setStatusLine(text) {
   $('status-line').textContent = text;
+}
+
+// ---------------------------------------------------------------- синхронизация
+
+/** Выполняет отложенную операцию. Пока копим только перемещения — см. sync.js. */
+async function performOp(op) {
+  if (op.kind === 'move') {
+    const updated = await api.moveCard(op.cardId, op.payload.status);
+    const card = state.cards.find((c) => c.id === op.cardId);
+    if (card) Object.assign(card, updated);
+    render();
+    return updated;
+  }
+  throw new Error(`неизвестный тип операции: ${op.kind}`);
+}
+
+const queue = new SyncQueue(performOp, renderSyncIndicator);
+
+/**
+ * Индикатор синхронизации: заметный, но не навязчивый — строка в шапке,
+ * без модалок и без блокировки работы.
+ */
+function renderSyncIndicator({ state: syncState, size, lastError }) {
+  const box = $('sync-indicator');
+  if (!box) return;
+  box.dataset.state = syncState;
+  const label = $('sync-label');
+  const retry = $('btn-retry');
+
+  if (syncState === 'synced') {
+    label.textContent = 'всё сохранено';
+    retry.hidden = true;
+    box.title = 'Изменения на сервере';
+  } else if (syncState === 'syncing') {
+    label.textContent = 'синхронизация…';
+    retry.hidden = true;
+    box.title = 'Отправляем изменения';
+  } else {
+    const word = size === 1 ? 'правка ждёт' : size < 5 ? 'правки ждут' : 'правок ждут';
+    label.textContent = `${size} ${word} сети`;
+    retry.hidden = false;
+    box.title = lastError ? `Последняя ошибка: ${lastError.message}` : 'Ждём связи с сервером';
+  }
 }
 
 // ---------------------------------------------------------------- рендер
@@ -212,22 +256,30 @@ async function loadCommentCounts() {
   if (changed) render();
 }
 
-/** Оптимистичный перенос: сразу двигаем в UI, при ошибке откатываем. */
-async function moveCard(id, status) {
+/**
+ * Оптимистичный перенос через очередь.
+ *
+ * Карточка едет сразу. Дальше два сценария:
+ *   - сеть/сервер недоступны → операция копится и повторяется автоматически,
+ *     карточка остаётся в новой колонке (пользователь видит счётчик правок);
+ *   - сервер ответил 4xx → повтор бессмыслен, откатываем и показываем ошибку.
+ */
+function moveCard(id, status) {
   const card = state.cards.find((c) => c.id === id);
   if (!card || card.status === status) return;
   const previous = card.status;
   card.status = status;
   render();
-  try {
-    const updated = await api.moveCard(id, status);
-    Object.assign(card, updated);
-    render();
-  } catch (error) {
-    card.status = previous; // откат — доска не должна врать о состоянии сервера
-    render();
+
+  const op = queue.enqueue('move', id, { status });
+  op.onPermanentFailure = (error) => {
+    const current = state.cards.find((c) => c.id === id);
+    if (current) {
+      current.status = previous; // доска не должна врать о состоянии сервера
+      render();
+    }
     reportError(error, `Не удалось перенести карточку #${id}`);
-  }
+  };
 }
 
 // ---------------------------------------------------------------- диалог карточки
@@ -248,7 +300,19 @@ function openCardDialog(card = null) {
 }
 
 $('btn-new').addEventListener('click', () => openCardDialog());
-$('btn-refresh').addEventListener('click', loadBoard);
+$('btn-refresh').addEventListener('click', () => {
+  // Обновление с непустой очередью затёрло бы неотправленные правки ответом
+  // сервера. Сначала пробуем их отправить.
+  if (queue.size) {
+    toast('Сначала отправляем накопленные правки', 'info', 'Синхронизация');
+    queue.flushNow().then(() => {
+      if (!queue.size) loadBoard();
+    });
+    return;
+  }
+  loadBoard();
+});
+$('btn-retry').addEventListener('click', () => queue.flushNow());
 $('btn-cancel').addEventListener('click', () => cardDialog.close());
 
 $('card-form').addEventListener('submit', async (e) => {
@@ -295,7 +359,28 @@ $('card-form').addEventListener('submit', async (e) => {
 $('btn-delete').addEventListener('click', async () => {
   const id = state.editingId;
   if (!id) return;
-  if (!confirm(`Удалить карточку #${id}? Комментарии тоже пропадут.`)) return;
+
+  // Предупреждение по существу: рефлекторное «вы уверены?» на всё подряд
+  // приучает жать «да» не глядя. Пугаем только там, где есть что терять —
+  // и говорим, сколько именно комментариев исчезнет.
+  const card = state.cards.find((c) => c.id === id);
+  const title = card ? `«${card.title}»` : `#${id}`;
+  let count = state.commentCounts.get(id);
+  if (count === undefined) {
+    try {
+      count = (await api.listComments(id)).length;
+      state.commentCounts.set(id, count);
+    } catch (_) {
+      count = 0; // счётчик не критичен: не смогли узнать — не пугаем зря
+    }
+  }
+  if (count > 0) {
+    const word = count === 1 ? 'комментарий' : count < 5 ? 'комментария' : 'комментариев';
+    if (!confirm(`Удалить карточку ${title}?\n\nВместе с ней исчезнет ${count} ${word} — это необратимо.`)) return;
+  } else if (!confirm(`Удалить карточку ${title}?`)) {
+    return;
+  }
+
   try {
     await api.deleteCard(id);
     state.commentCounts.delete(id);
@@ -399,4 +484,25 @@ $('btn-edit').addEventListener('click', () => {
 
 // ---------------------------------------------------------------- старт
 
+// Браузер сообщил, что сеть вернулась — не ждём следующего тика backoff.
+window.addEventListener('online', () => {
+  if (queue.size) {
+    toast('Сеть вернулась — отправляем накопленные правки', 'success');
+    queue.flushNow();
+  }
+});
+
+// Уходя со страницы с неотправленными правками, предупреждаем: очередь живёт
+// в памяти, перезагрузка её потеряет.
+window.addEventListener('beforeunload', (e) => {
+  if (queue.size) {
+    e.preventDefault();
+    e.returnValue = '';
+  }
+});
+
+renderSyncIndicator({ state: 'synced', size: 0, lastError: null });
 loadBoard();
+
+// Для тестов: доступ к очереди из браузерного контекста.
+window.__kanban = { queue, state };
