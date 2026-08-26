@@ -40,27 +40,47 @@ def server_reachable():
 
 
 @pytest.fixture()
-def client():
-    """Клиент + реестр созданных карточек: за собой убираем, чужие данные не трогаем."""
-    created: list[int] = []
-    with httpx.Client(base_url=API, timeout=10) as c:
-        c.created = created  # type: ignore[attr-defined]
-        yield c
-    # teardown: удаляем только то, что создали сами
-    with httpx.Client(base_url=API, timeout=10) as c:
-        for cid in created:
-            c.delete(f"/cards/{cid}")
+def created():
+    """Реестр карточек, созданных тестом.
+
+    Отдельная фикстура, а не атрибут, навешенный на httpx.Client: по замечанию
+    обоих ревьюеров `c.created = [...]` — это негласный контракт между фикстурами,
+    который легко порвать. Явный список читается честнее.
+    """
+    return []
 
 
 @pytest.fixture()
-def make_card(client):
+def client(created):
+    """HTTP-клиент. В teardown убираем созданные тестом карточки и говорим, если не вышло."""
+    with httpx.Client(base_url=API, timeout=10) as c:
+        yield c
+    failed: list[tuple[int, int]] = []
+    with httpx.Client(base_url=API, timeout=10) as c:
+        for cid in created:
+            try:
+                r = c.delete(f"/cards/{cid}")
+            except httpx.HTTPError as e:  # сеть отвалилась — молча не глотаем
+                failed.append((cid, -1))
+                print(f"\n[teardown] не смог удалить карточку {cid}: {e}")
+                continue
+            # 404 допустим: тест мог удалить карточку сам
+            if r.status_code not in (204, 404):
+                failed.append((cid, r.status_code))
+    if failed:
+        # Не роняем тест из-за уборки, но и не молчим: иначе мусор копится на доске незаметно.
+        print(f"\n[teardown] ВНИМАНИЕ: карточки не удалены {failed} — на доске останется мусор")
+
+
+@pytest.fixture()
+def make_card(client, created):
     """Создаёт карточку и запоминает её для уборки."""
 
     def _make(**overrides):
         payload = {"title": "тестовая карточка", **overrides}
         r = client.post("/cards", json=payload)
         assert r.status_code == 201, f"не смог создать карточку для теста: {r.status_code} {r.text}"
-        client.created.append(r.json()["id"])  # type: ignore[attr-defined]
+        created.append(r.json()["id"])
         return r.json()
 
     return _make
