@@ -208,3 +208,68 @@ def test_комментарий_к_несуществующей_карточке
         client.post("/cards/999999/comments", json={"text": "ау"}),
         "POST /cards/999999/comments",
     )
+
+
+# ---------- 422 по контракту: {"detail": "<строка>", "errors": [...]} ----------
+#
+# Контракт (раздел «Коды и формат ошибок», зафиксирован по итогам PR #8) требует
+# для 422 ту же форму detail, что и для 404 — строку, плюс необязательное поле
+# errors с подробностями. Проверяем это строго, а не только код ответа: именно
+# форма тела разъезжалась в PR #8, и без такой проверки регресс пройдёт мимо
+# сьюта — коды-то останутся прежними.
+
+def _assert_422_with_string_detail(r, what):
+    assert r.status_code == 422, f"{what} -> {r.status_code}, ждём 422"
+    payload = r.json()
+    detail = payload.get("detail")
+    assert isinstance(detail, str), (
+        f'контракт требует 422 {{"detail": "<строка>"}}, получено {detail!r} ({what})'
+    )
+    assert detail.strip(), f"detail не должен быть пустым ({what})"
+    if "errors" in payload:
+        assert isinstance(payload["errors"], list), (
+            f'поле errors должно быть списком, получено {type(payload["errors"]).__name__} ({what})'
+        )
+
+
+def test_пустой_title_это_422_со_строкой(client):
+    _assert_422_with_string_detail(
+        client.post("/cards", json={"title": ""}), "POST /cards с пустым title"
+    )
+
+
+def test_слишком_длинный_title_это_422_со_строкой(client):
+    _assert_422_with_string_detail(
+        client.post("/cards", json={"title": "x" * 201}), "POST /cards с title 201 символ"
+    )
+
+
+def test_невалидный_priority_при_создании_это_422_со_строкой(client):
+    _assert_422_with_string_detail(
+        client.post("/cards", json={"title": "ок", "priority": "срочно"}),
+        "POST /cards с невалидным priority",
+    )
+
+
+def test_невалидный_status_при_patch_это_422_со_строкой(client, make_card):
+    card = make_card()
+    _assert_422_with_string_detail(
+        client.patch(f"/cards/{card['id']}", json={"status": "архив"}),
+        "PATCH с невалидным status",
+    )
+
+
+def test_невалидный_priority_при_patch_это_422_со_строкой(client, make_card):
+    card = make_card()
+    _assert_422_with_string_detail(
+        client.patch(f"/cards/{card['id']}", json={"priority": "ultra"}),
+        "PATCH с невалидным priority",
+    )
+
+
+def test_пустой_комментарий_это_422_со_строкой(client, make_card):
+    card = make_card()
+    _assert_422_with_string_detail(
+        client.post(f"/cards/{card['id']}/comments", json={"text": ""}),
+        "POST комментария с пустым text",
+    )
