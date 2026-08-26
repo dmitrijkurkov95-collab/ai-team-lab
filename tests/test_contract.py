@@ -9,6 +9,8 @@ import re
 
 import pytest
 
+from contract_checks import assert_404_string_detail, assert_422_shape
+
 STATUSES = {"backlog", "in_progress", "review", "done"}
 PRIORITIES = {"low", "normal", "high"}
 CARD_KEYS = {"id", "title", "description", "status", "priority", "created_at", "updated_at"}
@@ -71,15 +73,30 @@ def test_фильтр_показывает_карточку_в_её_колонк
 
 # ---------- POST /cards ----------
 
-def test_создание_возвращает_карточку_с_дефолтами(client):
+def test_создание_возвращает_карточку_с_дефолтами(client, created):
     r = client.post("/cards", json={"title": "минимальное тело"})
-    assert r.status_code == 201, "201 — см. примечание про коды успеха в README"
+    assert r.status_code in (200, 201), "контракт: POST -> 201 (допустим 200)"
     body = r.json()
-    client.created.append(body["id"])  # type: ignore[attr-defined]
+    created.append(body["id"])
     assert body["title"] == "минимальное тело"
     assert body["description"] == "", "дефолт description — пустая строка"
     assert body["priority"] == "normal", "дефолт priority — normal"
     assert body["status"] in STATUSES
+
+
+def test_код_создания_карточки_по_контракту(client, created):
+    """Раньше был в gap-слое: контракт молчал. После 8bf91f6 задан явно —
+    `POST -> 201 (допустим 200)`. Переведён в строгий слой по ревью Agent-2.
+    """
+    r = client.post("/cards", json={"title": "код создания"})
+    assert r.status_code in (200, 201), f"контракт: 201 или 200, получено {r.status_code}"
+    created.append(r.json()["id"])
+
+
+def test_код_создания_комментария_по_контракту(client, make_card):
+    card = make_card()
+    r = client.post(f"/cards/{card['id']}/comments", json={"text": "код создания"})
+    assert r.status_code in (200, 201), f"контракт: 201 или 200, получено {r.status_code}"
 
 
 def test_созданная_карточка_видна_в_списке(client, make_card):
@@ -175,101 +192,181 @@ def test_у_новой_карточки_комментариев_нет(client, 
 
 # ---------- 404 по контракту: {"detail": "..."} ----------
 
-def _assert_404_with_string_detail(r, what):
-    assert r.status_code == 404, f"{what} -> {r.status_code}, ждём 404"
-    detail = r.json().get("detail")
-    assert isinstance(detail, str), (
-        f'контракт требует 404 {{"detail": "..."}} строкой, получено {detail!r} ({what})'
-    )
-
-
 def test_get_несуществующей_карточки_это_404_со_строкой(client):
-    _assert_404_with_string_detail(client.get("/cards/999999"), "GET /cards/999999")
+    assert_404_string_detail(client.get("/cards/999999"), "GET /cards/999999")
 
 
 def test_patch_несуществующей_карточки_это_404_со_строкой(client):
-    _assert_404_with_string_detail(
+    assert_404_string_detail(
         client.patch("/cards/999999", json={"status": "done"}), "PATCH /cards/999999"
     )
 
 
 def test_delete_несуществующей_карточки_это_404_со_строкой(client):
-    _assert_404_with_string_detail(client.delete("/cards/999999"), "DELETE /cards/999999")
+    assert_404_string_detail(client.delete("/cards/999999"), "DELETE /cards/999999")
 
 
 def test_список_комментариев_несуществующей_карточки_это_404_со_строкой(client):
-    _assert_404_with_string_detail(
+    assert_404_string_detail(
         client.get("/cards/999999/comments"), "GET /cards/999999/comments"
     )
 
 
 def test_комментарий_к_несуществующей_карточке_это_404_со_строкой(client):
-    _assert_404_with_string_detail(
+    assert_404_string_detail(
         client.post("/cards/999999/comments", json={"text": "ау"}),
         "POST /cards/999999/comments",
     )
 
 
-# ---------- 422 по контракту: {"detail": "<строка>", "errors": [...]} ----------
+# ---------- 422: форма тела по контракту ----------
 #
-# Контракт (раздел «Коды и формат ошибок», зафиксирован по итогам PR #8) требует
-# для 422 ту же форму detail, что и для 404 — строку, плюс необязательное поле
-# errors с подробностями. Проверяем это строго, а не только код ответа: именно
-# форма тела разъезжалась в PR #8, и без такой проверки регресс пройдёт мимо
-# сьюта — коды-то останутся прежними.
+# Добавлено по ревью Agent-2 в PR #10. Замечание было по делу: раньше 422
+# проверялись только на КОД и только в edge_cases, поэтому сьют не поймал бы
+# регресс формата ошибок, который команда только что чинила в PR #8.
 
-def _assert_422_with_string_detail(r, what):
-    assert r.status_code == 422, f"{what} -> {r.status_code}, ждём 422"
-    payload = r.json()
-    detail = payload.get("detail")
-    assert isinstance(detail, str), (
-        f'контракт требует 422 {{"detail": "<строка>"}}, получено {detail!r} ({what})'
-    )
-    assert detail.strip(), f"detail не должен быть пустым ({what})"
-    if "errors" in payload:
-        assert isinstance(payload["errors"], list), (
-            f'поле errors должно быть списком, получено {type(payload["errors"]).__name__} ({what})'
-        )
+def test_422_пустой_title_имеет_строковый_detail(client):
+    assert_422_shape(client.post("/cards", json={"title": ""}), "POST /cards {title: ''}")
 
 
-def test_пустой_title_это_422_со_строкой(client):
-    _assert_422_with_string_detail(
-        client.post("/cards", json={"title": ""}), "POST /cards с пустым title"
-    )
+def test_422_длинный_title_имеет_строковый_detail(client):
+    r = client.post("/cards", json={"title": "x" * 201})
+    assert_422_shape(r, "POST /cards title>200")
 
 
-def test_слишком_длинный_title_это_422_со_строкой(client):
-    _assert_422_with_string_detail(
-        client.post("/cards", json={"title": "x" * 201}), "POST /cards с title 201 символ"
-    )
+def test_422_кривой_priority_в_post_имеет_строковый_detail(client):
+    r = client.post("/cards", json={"title": "t", "priority": "critical"})
+    assert_422_shape(r, "POST /cards priority=critical")
 
 
-def test_невалидный_priority_при_создании_это_422_со_строкой(client):
-    _assert_422_with_string_detail(
-        client.post("/cards", json={"title": "ок", "priority": "срочно"}),
-        "POST /cards с невалидным priority",
-    )
-
-
-def test_невалидный_status_при_patch_это_422_со_строкой(client, make_card):
+def test_422_кривой_status_в_patch_имеет_строковый_detail(client, make_card):
     card = make_card()
-    _assert_422_with_string_detail(
-        client.patch(f"/cards/{card['id']}", json={"status": "архив"}),
-        "PATCH с невалидным status",
-    )
+    r = client.patch(f"/cards/{card['id']}", json={"status": "archived"})
+    assert_422_shape(r, "PATCH /cards/{id} status=archived")
 
 
-def test_невалидный_priority_при_patch_это_422_со_строкой(client, make_card):
+def test_422_кривой_priority_в_patch_имеет_строковый_detail(client, make_card):
     card = make_card()
-    _assert_422_with_string_detail(
-        client.patch(f"/cards/{card['id']}", json={"priority": "ultra"}),
-        "PATCH с невалидным priority",
-    )
+    r = client.patch(f"/cards/{card['id']}", json={"priority": "urgent"})
+    assert_422_shape(r, "PATCH /cards/{id} priority=urgent")
 
 
-def test_пустой_комментарий_это_422_со_строкой(client, make_card):
+def test_422_кривой_фильтр_статуса_имеет_строковый_detail(client):
+    """Форма обязательна для любого 422; сам факт 422 здесь — gap (см. edge_cases)."""
+    assert_422_shape(client.get("/cards", params={"status": "не_статус"}), "GET /cards?status=не_статус")
+
+
+def test_422_не_число_в_пути_имеет_строковый_detail(client):
+    assert_422_shape(client.get("/cards/abc"), "GET /cards/abc")
+
+
+def test_422_пустой_комментарий_имеет_строковый_detail(client, make_card):
     card = make_card()
-    _assert_422_with_string_detail(
-        client.post(f"/cards/{card['id']}/comments", json={"text": ""}),
-        "POST комментария с пустым text",
+    r = client.post(f"/cards/{card['id']}/comments", json={"text": ""})
+    assert_422_shape(r, "POST /cards/{id}/comments text=''")
+
+
+def test_успешные_ответы_не_содержат_поля_ошибок(client, make_card):
+    """Обратная проверка: форма ошибки не должна протекать в успешные ответы."""
+    card = make_card()
+    r = client.get(f"/cards/{card['id']}")
+    assert "detail" not in r.json() and "errors" not in r.json()
+
+
+# ---------- Параметры списка GET /cards (спринт 2, задача #14) ----------
+
+def test_фильтр_по_priority(client, make_card):
+    make_card(title="низкий", priority="low")
+    make_card(title="высокий", priority="high")
+    for p in ("low", "normal", "high"):
+        got = client.get("/cards", params={"priority": p})
+        assert got.status_code == 200
+        assert all(c["priority"] == p for c in got.json()), f"в выдаче priority={p} чужие карточки"
+
+
+def test_фильтры_status_и_priority_комбинируются(client, make_card):
+    make_card(title="цель", priority="high")
+    got = client.get("/cards", params={"status": "backlog", "priority": "high"})
+    assert got.status_code == 200
+    assert all(c["status"] == "backlog" and c["priority"] == "high" for c in got.json())
+
+
+def test_фильтр_без_совпадений_это_200_и_пустой_массив(client):
+    """Контракт: «фильтр ничего не нашёл -> 200 и [], это не ошибка»."""
+    r = client.get("/cards", params={"priority": "low", "status": "done"})
+    assert r.status_code == 200
+    assert isinstance(r.json(), list)
+
+
+def test_limit_ограничивает_выдачу(client, make_card):
+    for i in range(5):
+        make_card(title=f"лимит {i}")
+    r = client.get("/cards", params={"limit": 2})
+    assert r.status_code == 200
+    assert len(r.json()) == 2, "limit=2 должен вернуть ровно 2 карточки"
+
+
+def test_limit_берёт_первые_по_возрастанию_id(client, make_card):
+    """Контракт: «не больше N карточек, первые по возрастанию id»."""
+    all_ids = [c["id"] for c in client.get("/cards").json()]
+    limited = [c["id"] for c in client.get("/cards", params={"limit": 3}).json()]
+    assert limited == all_ids[:3], "limit должен резать с начала, а не с конца"
+
+
+def test_без_limit_возвращаются_все_карточки(client):
+    """Контракт: дефолтного лимита нет — молчаливое обрезание запрещено."""
+    r = client.get("/cards")
+    total = r.headers.get("X-Total-Count")
+    assert total is not None, "контракт требует заголовок X-Total-Count"
+    assert len(r.json()) == int(total), "без limit выдача должна быть полной"
+
+
+def test_x_total_count_не_учитывает_limit(client, make_card):
+    """Контракт: X-Total-Count — сколько попадает под фильтр БЕЗ учёта limit."""
+    for i in range(4):
+        make_card(title=f"подсчёт {i}")
+    full = int(client.get("/cards").headers["X-Total-Count"])
+    r = client.get("/cards", params={"limit": 1})
+    assert len(r.json()) == 1
+    assert int(r.headers["X-Total-Count"]) == full, (
+        "X-Total-Count не должен меняться от limit — иначе клиент не увидит, что выдача урезана"
     )
+
+
+def test_x_total_count_учитывает_фильтр(client, make_card):
+    make_card(title="только high", priority="high")
+    high = client.get("/cards", params={"priority": "high"})
+    assert int(high.headers["X-Total-Count"]) == len(high.json())
+
+
+@pytest.mark.parametrize("bad", [0, -1, -100])
+def test_limit_вне_диапазона_это_422(client, bad):
+    """Контракт: limit=0 и отрицательный -> 422."""
+    r = client.get("/cards", params={"limit": bad})
+    assert r.status_code == 422
+    assert_422_shape(r, f"GET /cards?limit={bad}")
+
+
+def test_limit_больше_потолка_это_422(client):
+    """Контракт: limit>200 -> 422, а НЕ молчаливое обрезание."""
+    r = client.get("/cards", params={"limit": 201})
+    assert r.status_code == 422, "обрезание вместо 422 — клиент посчитает выдачу полной"
+    assert_422_shape(r, "GET /cards?limit=201")
+
+
+def test_limit_ровно_на_потолке_проходит(client):
+    assert client.get("/cards", params={"limit": 200}).status_code == 200
+
+
+@pytest.mark.parametrize("bad", ["abc", "", "1.5", "  "])
+def test_limit_не_целое_это_422(client, bad):
+    """Контракт: не число и пустой ?limit= -> 422."""
+    r = client.get("/cards", params={"limit": bad})
+    assert r.status_code == 422
+    assert_422_shape(r, f"GET /cards?limit={bad!r}")
+
+
+def test_невалидный_priority_в_фильтре_это_422(client):
+    r = client.get("/cards", params={"priority": "critical"})
+    assert r.status_code == 422
+    assert_422_shape(r, "GET /cards?priority=critical")
