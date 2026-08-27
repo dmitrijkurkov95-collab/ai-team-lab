@@ -22,6 +22,9 @@ from app.storage import Storage  # noqa: E402
 
 API = "/api/v1"
 
+#: mode=replace стирает доску, поэтому требует подтверждения (#54).
+CONFIRM = {"X-Confirm-Replace": "yes"}
+
 
 @pytest.fixture()
 def client(tmp_path):
@@ -1019,7 +1022,7 @@ def test_round_trip_gives_equivalent_board(client):
     make_card(client, title="Вторая", description="детали", status="done")
 
     exported = client.get(f"{API}/export").json()
-    assert client.post(f"{API}/import", params={"mode": "replace"}, json=exported).status_code == 200
+    assert client.post(f"{API}/import", params={"mode": "replace"}, headers=CONFIRM, json=exported).status_code == 200
     again = client.get(f"{API}/export").json()
 
     # exported_at меняется по определению — сравниваем содержимое доски.
@@ -1029,20 +1032,20 @@ def test_round_trip_gives_equivalent_board(client):
 def test_replace_wipes_previous_board(client):
     make_card(client, title="старая")
     payload = {"format_version": 1, "cards": [{"id": 1, "title": "новая"}]}
-    client.post(f"{API}/import", params={"mode": "replace"}, json=payload)
+    client.post(f"{API}/import", params={"mode": "replace"}, headers=CONFIRM, json=payload)
     titles = [c["title"] for c in client.get(f"{API}/cards").json()]
     assert titles == ["новая"]
 
 
 def test_replace_preserves_ids(client):
     payload = {"format_version": 1, "cards": [{"id": 77, "title": "с номером"}]}
-    client.post(f"{API}/import", params={"mode": "replace"}, json=payload)
+    client.post(f"{API}/import", params={"mode": "replace"}, headers=CONFIRM, json=payload)
     assert client.get(f"{API}/cards").json()[0]["id"] == 77
 
 
 def test_new_card_after_replace_does_not_reuse_id(client):
     """AUTOINCREMENT должен продолжить с максимума, иначе id столкнутся."""
-    client.post(f"{API}/import", params={"mode": "replace"}, json={"format_version": 1, "cards": [{"id": 50, "title": "а"}]})
+    client.post(f"{API}/import", params={"mode": "replace"}, headers=CONFIRM, json={"format_version": 1, "cards": [{"id": 50, "title": "а"}]})
     fresh = make_card(client, title="следующая")
     assert fresh["id"] > 50
 
@@ -1068,13 +1071,13 @@ def test_merge_does_not_overwrite_card_with_same_id(client):
 
 
 def test_import_rejects_unknown_format_version(client):
-    r = client.post(f"{API}/import", params={"mode": "replace"}, json={"format_version": 99, "cards": []})
+    r = client.post(f"{API}/import", params={"mode": "replace"}, headers=CONFIRM, json={"format_version": 99, "cards": []})
     assert r.status_code == 422 and isinstance(r.json()["detail"], str)
 
 
 def test_import_rejects_duplicate_ids_in_file(client):
     payload = {"format_version": 1, "cards": [{"id": 1, "title": "а"}, {"id": 1, "title": "б"}]}
-    r = client.post(f"{API}/import", params={"mode": "replace"}, json=payload)
+    r = client.post(f"{API}/import", params={"mode": "replace"}, headers=CONFIRM, json=payload)
     assert r.status_code == 422 and "duplicate" in r.json()["detail"]
 
 
@@ -1091,7 +1094,7 @@ def test_import_rejects_duplicate_ids_in_file(client):
 )
 def test_import_validates_cards_like_post(client, bad_card):
     """Импорт не должен быть дырой в обход обычной валидации."""
-    r = client.post(f"{API}/import", params={"mode": "replace"}, json={"format_version": 1, "cards": [bad_card]})
+    r = client.post(f"{API}/import", params={"mode": "replace"}, headers=CONFIRM, json={"format_version": 1, "cards": [bad_card]})
     assert r.status_code == 422
 
 
@@ -1108,19 +1111,19 @@ def test_failed_import_leaves_board_untouched(client):
 
 def test_import_empty_board_clears_everything(client):
     make_card(client, title="уйдёт")
-    client.post(f"{API}/import", params={"mode": "replace"}, json={"format_version": 1, "cards": []})
+    client.post(f"{API}/import", params={"mode": "replace"}, headers=CONFIRM, json={"format_version": 1, "cards": []})
     assert client.get(f"{API}/cards").json() == []
 
 
 def test_import_card_without_id_gets_one(client):
-    r = client.post(f"{API}/import", params={"mode": "replace"}, json={"format_version": 1, "cards": [{"title": "без id"}]})
+    r = client.post(f"{API}/import", params={"mode": "replace"}, headers=CONFIRM, json={"format_version": 1, "cards": [{"title": "без id"}]})
     assert r.status_code == 200
     assert isinstance(client.get(f"{API}/cards").json()[0]["id"], int)
 
 
 def test_import_reports_counts(client):
     payload = {"format_version": 1, "cards": [{"title": "а"}, {"title": "б"}]}
-    body = client.post(f"{API}/import", params={"mode": "replace"}, json=payload).json()
+    body = client.post(f"{API}/import", params={"mode": "replace"}, headers=CONFIRM, json=payload).json()
     assert body == {"mode": "replace", "imported_cards": 2, "total_cards": 2}
 
 
@@ -1139,7 +1142,7 @@ def test_import_preserves_comments_and_timestamps(client):
             }
         ],
     }
-    client.post(f"{API}/import", params={"mode": "replace"}, json=payload)
+    client.post(f"{API}/import", params={"mode": "replace"}, headers=CONFIRM, json=payload)
     card = client.get(f"{API}/cards/5").json()
     assert card["created_at"] == "2026-01-01T00:00:00Z"
     comments = client.get(f"{API}/cards/5/comments").json()
@@ -1152,7 +1155,7 @@ def test_round_trip_after_merge_is_still_valid(client):
     client.post(f"{API}/import", params={"mode": "merge"}, json=exported)
     again = client.get(f"{API}/export").json()
     assert len(again["cards"]) == 2
-    assert client.post(f"{API}/import", params={"mode": "replace"}, json=again).status_code == 200
+    assert client.post(f"{API}/import", params={"mode": "replace"}, headers=CONFIRM, json=again).status_code == 200
 
 
 # --- защита от мусорного импорта (ревью PR #45: Agent-2 и лид) ---
@@ -1177,7 +1180,7 @@ def test_garbage_import_never_wipes_board(client, body):
     make_card(client, title="не должна пропасть")
     before = client.get(f"{API}/cards").json()
 
-    r = client.post(f"{API}/import", params={"mode": "replace"}, json=body)
+    r = client.post(f"{API}/import", params={"mode": "replace"}, headers=CONFIRM, json=body)
 
     assert r.status_code == 422, f"тело {body!r} обязано быть отвергнуто"
     assert isinstance(r.json()["detail"], str)
@@ -1187,7 +1190,7 @@ def test_garbage_import_never_wipes_board(client, body):
 @pytest.mark.parametrize("bad", ["не массив", 42, {"id": 1}, None])
 def test_import_rejects_non_list_cards(client, bad):
     make_card(client, title="цела")
-    r = client.post(f"{API}/import", params={"mode": "replace"}, json={"format_version": 1, "cards": bad})
+    r = client.post(f"{API}/import", params={"mode": "replace"}, headers=CONFIRM, json={"format_version": 1, "cards": bad})
     assert r.status_code == 422
     assert len(client.get(f"{API}/cards").json()) == 1
 
@@ -1195,7 +1198,7 @@ def test_import_rejects_non_list_cards(client, bad):
 def test_explicit_empty_cards_still_clears_board(client):
     """Явное `"cards": []` — осознанная команда очистить, она остаётся легальной."""
     make_card(client, title="уйдёт по явной команде")
-    r = client.post(f"{API}/import", params={"mode": "replace"}, json={"format_version": 1, "cards": []})
+    r = client.post(f"{API}/import", params={"mode": "replace"}, headers=CONFIRM, json={"format_version": 1, "cards": []})
     assert r.status_code == 200 and client.get(f"{API}/cards").json() == []
 
 
@@ -1204,4 +1207,130 @@ def test_import_requires_explicit_mode(client):
     make_card(client, title="цела без mode")
     r = client.post(f"{API}/import", json={"format_version": 1, "cards": []})
     assert r.status_code == 422
+    assert len(client.get(f"{API}/cards").json()) == 1
+
+
+# ------------------------------------------- безопасность импорта (#54)
+
+
+def test_replace_without_confirmation_is_428(client):
+    """Разрушительный режим требует явного подтверждения, доска цела."""
+    make_card(client, title="не должна пропасть")
+    r = client.post(f"{API}/import", params={"mode": "replace"},
+                    json={"format_version": 1, "cards": []})
+    assert r.status_code == 428
+    assert "X-Confirm-Replace" in r.json()["detail"]
+    assert len(client.get(f"{API}/cards").json()) == 1
+
+
+@pytest.mark.parametrize("bad", ["", "no", "true", "YES ", "1"])
+def test_replace_with_wrong_confirmation_is_428(client, bad):
+    make_card(client, title="цела")
+    r = client.post(f"{API}/import", params={"mode": "replace"},
+                    headers={"X-Confirm-Replace": bad},
+                    json={"format_version": 1, "cards": []})
+    assert r.status_code == 428
+    assert len(client.get(f"{API}/cards").json()) == 1
+
+
+def test_replace_with_confirmation_works(client):
+    make_card(client, title="уйдёт по подтверждённой команде")
+    r = client.post(f"{API}/import", params={"mode": "replace"}, headers=CONFIRM,
+                    json={"format_version": 1, "cards": []})
+    assert r.status_code == 200 and client.get(f"{API}/cards").json() == []
+
+
+def test_merge_does_not_require_confirmation(client):
+    """merge ничего не теряет — трение здесь было бы без выигрыша."""
+    make_card(client, title="своя")
+    r = client.post(f"{API}/import", params={"mode": "merge"},
+                    json={"format_version": 1, "cards": [{"title": "пришедшая"}]})
+    assert r.status_code == 200 and len(client.get(f"{API}/cards").json()) == 2
+
+
+def test_import_over_card_limit_is_413(client):
+    from app.main import MAX_IMPORT_CARDS
+
+    payload = {"format_version": 1,
+               "cards": [{"title": f"к{i}"} for i in range(MAX_IMPORT_CARDS + 1)]}
+    r = client.post(f"{API}/import", params={"mode": "merge"}, json=payload)
+    assert r.status_code == 413 and str(MAX_IMPORT_CARDS) in r.json()["detail"]
+
+
+def test_import_at_card_limit_passes(client):
+    """Граница включительная: ровно потолок — legal."""
+    from app.main import MAX_IMPORT_CARDS
+
+    payload = {"format_version": 1,
+               "cards": [{"title": f"к{i}"} for i in range(MAX_IMPORT_CARDS)]}
+    r = client.post(f"{API}/import", params={"mode": "replace"}, headers=CONFIRM, json=payload)
+    assert r.status_code == 200
+
+
+def test_import_oversized_body_is_413(client):
+    from app.main import MAX_IMPORT_BYTES
+
+    r = client.post(
+        f"{API}/import",
+        params={"mode": "merge"},
+        headers={"Content-Length": str(MAX_IMPORT_BYTES + 1), "Content-Type": "application/json"},
+        content=b'{"format_version": 1, "cards": []}',
+    )
+    assert r.status_code == 413
+
+
+# --- опциональный токен на мутирующие ручки ---
+
+
+@pytest.fixture()
+def secured(monkeypatch):
+    """Включает защиту записи на время теста."""
+    monkeypatch.setenv("KANBAN_WRITE_TOKEN", "s3cret")
+    return {"X-Auth-Token": "s3cret"}
+
+
+def test_reads_stay_open_when_token_set(client, secured):
+    """Чтение не закрываем: доску можно показывать, менять — нет."""
+    assert client.get(f"{API}/cards").status_code == 200
+    assert client.get(f"{API}/health").status_code == 200
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda c: c.post(f"{API}/cards", json={"title": "без токена"}),
+        lambda c: c.patch(f"{API}/cards/1", json={"status": "done"}),
+        lambda c: c.delete(f"{API}/cards/1"),
+        lambda c: c.post(f"{API}/cards/1/comments", json={"text": "т"}),
+        lambda c: c.post(f"{API}/import", params={"mode": "merge"},
+                         json={"format_version": 1, "cards": []}),
+    ],
+)
+def test_writes_require_token_when_set(client, secured, call):
+    r = call(client)
+    assert r.status_code == 401, f"мутирующий запрос прошёл без токена: {r.status_code}"
+
+
+def test_wrong_token_is_401(client, secured):
+    r = client.post(f"{API}/cards", json={"title": "чужой токен"},
+                    headers={"X-Auth-Token": "wrong"})
+    assert r.status_code == 401
+
+
+def test_correct_token_allows_write(client, secured):
+    r = client.post(f"{API}/cards", json={"title": "с токеном"}, headers=secured)
+    assert r.status_code == 201
+
+
+def test_no_token_env_keeps_api_open(client):
+    """Без переменной окружения ничего не меняется — локальная работа цела."""
+    assert client.post(f"{API}/cards", json={"title": "открытый режим"}).status_code == 201
+
+
+def test_token_and_confirmation_are_independent(client, secured):
+    """Токен есть, подтверждения нет — всё равно 428, доска цела."""
+    client.post(f"{API}/cards", json={"title": "цела"}, headers=secured)
+    r = client.post(f"{API}/import", params={"mode": "replace"}, headers=secured,
+                    json={"format_version": 1, "cards": []})
+    assert r.status_code == 428
     assert len(client.get(f"{API}/cards").json()) == 1
