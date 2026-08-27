@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 from contextlib import asynccontextmanager
 from typing import Literal, Optional
 
@@ -31,7 +32,42 @@ from .storage import DEFAULT_DB, Storage, StorageBusy, utcnow
 
 API_PREFIX = "/api/v1"
 
+#: Токен для мутирующих запросов. Не задан — API открыт, как раньше:
+#: локальная разработка и демо-стенд не должны требовать настройки.
+#: Задан — POST/PATCH/DELETE требуют заголовок X-Auth-Token.
+#: Читается на каждый запрос, а не один раз при импорте модуля: иначе тесты
+#: не смогли бы включать защиту через monkeypatch окружения.
+WRITE_TOKEN_ENV = "KANBAN_WRITE_TOKEN"
+
+#: Подтверждение для разрушительного импорта: mode=replace стирает доску.
+CONFIRM_HEADER = "X-Confirm-Replace"
+CONFIRM_VALUE = "yes"
+
+#: Потолки импорта. Тело больше — 413: разбор идёт целиком в память, и без
+#: потолка один запрос может её занять. 10 000 карточек с запасом покрывают
+#: реальную доску (сейчас счёт на десятки).
+MAX_IMPORT_CARDS = 10_000
+MAX_IMPORT_BYTES = 2 * 1024 * 1024
+
 _storage: Optional[Storage] = None
+
+
+def require_write_access(request: Request) -> None:
+    """Пускает мутирующий запрос, если защита выключена или токен совпал.
+
+    Сравнение через secrets.compare_digest — постоянное по времени. Для
+    локального стенда это перестраховка, но дешёвая: обычное сравнение строк
+    утекает длину совпавшего префикса.
+    """
+    expected = os.environ.get(WRITE_TOKEN_ENV)
+    if not expected:
+        return  # защита не включена — поведение как раньше
+    provided = request.headers.get("X-Auth-Token") or ""
+    if not secrets.compare_digest(provided, expected):
+        raise HTTPException(
+            status_code=401,
+            detail="Требуется заголовок X-Auth-Token с валидным токеном",
+        )
 
 
 def get_storage() -> Storage:
@@ -228,7 +264,11 @@ def list_cards(
     status_code=http_status.HTTP_201_CREATED,
     tags=["cards"],
 )
-def create_card(payload: CardCreate, store: Storage = Depends(get_storage)) -> dict:
+def create_card(
+    payload: CardCreate,
+    store: Storage = Depends(get_storage),
+    _: None = Depends(require_write_access),
+) -> dict:
     return store.create_card(
         title=payload.title,
         description=payload.description,
@@ -244,7 +284,12 @@ def get_card(card_id: int, store: Storage = Depends(get_storage)) -> dict:
 
 
 @app.patch(f"{API_PREFIX}/cards/{{card_id}}", response_model=Card, tags=["cards"])
-def update_card(card_id: int, payload: CardUpdate, store: Storage = Depends(get_storage)) -> dict:
+def update_card(
+    card_id: int,
+    payload: CardUpdate,
+    store: Storage = Depends(get_storage),
+    _: None = Depends(require_write_access),
+) -> dict:
     _card_or_404(store, card_id)
     # exclude_none нельзя применять огулом: `{"deadline": null}` — это осмысленный
     # запрос «снять срок», и он обязан отличаться от «поле не передано».
@@ -264,7 +309,11 @@ def update_card(card_id: int, payload: CardUpdate, store: Storage = Depends(get_
     status_code=http_status.HTTP_204_NO_CONTENT,
     tags=["cards"],
 )
-def delete_card(card_id: int, store: Storage = Depends(get_storage)) -> Response:
+def delete_card(
+    card_id: int,
+    store: Storage = Depends(get_storage),
+    _: None = Depends(require_write_access),
+) -> Response:
     if not store.delete_card(card_id):
         raise HTTPException(status_code=404, detail=f"Card {card_id} not found")
     return Response(status_code=http_status.HTTP_204_NO_CONTENT)
@@ -288,12 +337,14 @@ def export_board(store: Storage = Depends(get_storage)) -> dict:
 
 @app.post(f"{API_PREFIX}/import", tags=["exchange"])
 def import_board(
+    request: Request,
     payload: BoardImport,
     mode: Literal["replace", "merge"] = Query(
         ...,
         description="replace — заменить доску целиком (id сохраняются); merge — добавить к текущей",
     ),
     store: Storage = Depends(get_storage),
+    _: None = Depends(require_write_access),
 ) -> dict:
     """Загружает доску из файла обмена.
 
@@ -309,6 +360,31 @@ def import_board(
 
     Импорт атомарный: при ошибке база остаётся в исходном состоянии.
     """
+    # Потолок размера — до любой работы: смысл в том, чтобы не разбирать
+    # и не держать в памяти то, что заведомо великовато.
+    declared = request.headers.get("Content-Length")
+    if declared and declared.isdigit() and int(declared) > MAX_IMPORT_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Тело больше {MAX_IMPORT_BYTES} байт — импорт отклонён",
+        )
+    if len(payload.cards) > MAX_IMPORT_CARDS:
+        raise HTTPException(
+            status_code=413,
+            detail=f"В файле {len(payload.cards)} карточек, потолок {MAX_IMPORT_CARDS}",
+        )
+
+    # Подтверждение только для разрушительного режима: merge ничего не теряет,
+    # требовать заголовок и на нём — трение без выигрыша.
+    if mode == "replace" and request.headers.get(CONFIRM_HEADER) != CONFIRM_VALUE:
+        raise HTTPException(
+            status_code=428,
+            detail=(
+                f"Режим replace стирает доску целиком. "
+                f"Повторите запрос с заголовком {CONFIRM_HEADER}: {CONFIRM_VALUE}"
+            ),
+        )
+
     cards = [card.model_dump() for card in payload.cards]
 
     if mode == "replace":
@@ -379,7 +455,10 @@ def list_comments(card_id: int, store: Storage = Depends(get_storage)) -> list[d
     tags=["comments"],
 )
 def add_comment(
-    card_id: int, payload: CommentCreate, store: Storage = Depends(get_storage)
+    card_id: int,
+    payload: CommentCreate,
+    store: Storage = Depends(get_storage),
+    _: None = Depends(require_write_access),
 ) -> dict:
     _card_or_404(store, card_id)
     return store.add_comment(card_id, payload.text)
