@@ -27,6 +27,11 @@ HOP_BY_HOP = {
     "content-length",
 }
 
+#: Заголовки запроса, которые прокси не передаёт дальше.
+#: `host` — иначе бэкенд увидит адрес прокси; `content-length` urllib
+#: проставит сам по фактическому телу; остальное — hop-by-hop.
+SKIP_REQUEST_HEADERS = HOP_BY_HOP | {"host", "accept-encoding"}
+
 
 def _encode_path(path: str) -> str:
     """Привести путь с query к ASCII перед отправкой на бэкенд.
@@ -70,10 +75,18 @@ class Handler(SimpleHTTPRequestHandler):
         url = f"{API_TARGET}{_encode_path(self.path)}"
 
         req = urllib.request.Request(url, data=body, method=self.command)
-        ctype = self.headers.get("Content-Type")
-        if ctype:
-            req.add_header("Content-Type", ctype)
-        req.add_header("Accept", self.headers.get("Accept", "application/json"))
+        # Пробрасываем заголовки клиента как есть, кроме hop-by-hop и Host:
+        # прокси не должен решать за API, какие заголовки тому важны. Раньше
+        # здесь был белый список из Content-Type и Accept, и всё остальное
+        # молча терялось — например, X-Confirm-Replace для mode=replace
+        # (#54/#57) и токен записи, из-за чего клиент получал 428/403 на
+        # корректный запрос.
+        for key, value in self.headers.items():
+            if key.lower() in SKIP_REQUEST_HEADERS:
+                continue
+            req.add_header(key, value)
+        if not req.has_header("Accept"):
+            req.add_header("Accept", "application/json")
 
         try:
             with urllib.request.urlopen(req) as upstream:
