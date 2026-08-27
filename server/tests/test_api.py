@@ -923,7 +923,7 @@ def test_round_trip_gives_equivalent_board(client):
     make_card(client, title="Вторая", description="детали", status="done")
 
     exported = client.get(f"{API}/export").json()
-    assert client.post(f"{API}/import", json=exported).status_code == 200
+    assert client.post(f"{API}/import", params={"mode": "replace"}, json=exported).status_code == 200
     again = client.get(f"{API}/export").json()
 
     # exported_at меняется по определению — сравниваем содержимое доски.
@@ -933,20 +933,20 @@ def test_round_trip_gives_equivalent_board(client):
 def test_replace_wipes_previous_board(client):
     make_card(client, title="старая")
     payload = {"format_version": 1, "cards": [{"id": 1, "title": "новая"}]}
-    client.post(f"{API}/import", json=payload)
+    client.post(f"{API}/import", params={"mode": "replace"}, json=payload)
     titles = [c["title"] for c in client.get(f"{API}/cards").json()]
     assert titles == ["новая"]
 
 
 def test_replace_preserves_ids(client):
     payload = {"format_version": 1, "cards": [{"id": 77, "title": "с номером"}]}
-    client.post(f"{API}/import", json=payload)
+    client.post(f"{API}/import", params={"mode": "replace"}, json=payload)
     assert client.get(f"{API}/cards").json()[0]["id"] == 77
 
 
 def test_new_card_after_replace_does_not_reuse_id(client):
     """AUTOINCREMENT должен продолжить с максимума, иначе id столкнутся."""
-    client.post(f"{API}/import", json={"format_version": 1, "cards": [{"id": 50, "title": "а"}]})
+    client.post(f"{API}/import", params={"mode": "replace"}, json={"format_version": 1, "cards": [{"id": 50, "title": "а"}]})
     fresh = make_card(client, title="следующая")
     assert fresh["id"] > 50
 
@@ -972,13 +972,13 @@ def test_merge_does_not_overwrite_card_with_same_id(client):
 
 
 def test_import_rejects_unknown_format_version(client):
-    r = client.post(f"{API}/import", json={"format_version": 99, "cards": []})
+    r = client.post(f"{API}/import", params={"mode": "replace"}, json={"format_version": 99, "cards": []})
     assert r.status_code == 422 and isinstance(r.json()["detail"], str)
 
 
 def test_import_rejects_duplicate_ids_in_file(client):
     payload = {"format_version": 1, "cards": [{"id": 1, "title": "а"}, {"id": 1, "title": "б"}]}
-    r = client.post(f"{API}/import", json=payload)
+    r = client.post(f"{API}/import", params={"mode": "replace"}, json=payload)
     assert r.status_code == 422 and "duplicate" in r.json()["detail"]
 
 
@@ -995,7 +995,7 @@ def test_import_rejects_duplicate_ids_in_file(client):
 )
 def test_import_validates_cards_like_post(client, bad_card):
     """Импорт не должен быть дырой в обход обычной валидации."""
-    r = client.post(f"{API}/import", json={"format_version": 1, "cards": [bad_card]})
+    r = client.post(f"{API}/import", params={"mode": "replace"}, json={"format_version": 1, "cards": [bad_card]})
     assert r.status_code == 422
 
 
@@ -1012,19 +1012,19 @@ def test_failed_import_leaves_board_untouched(client):
 
 def test_import_empty_board_clears_everything(client):
     make_card(client, title="уйдёт")
-    client.post(f"{API}/import", json={"format_version": 1, "cards": []})
+    client.post(f"{API}/import", params={"mode": "replace"}, json={"format_version": 1, "cards": []})
     assert client.get(f"{API}/cards").json() == []
 
 
 def test_import_card_without_id_gets_one(client):
-    r = client.post(f"{API}/import", json={"format_version": 1, "cards": [{"title": "без id"}]})
+    r = client.post(f"{API}/import", params={"mode": "replace"}, json={"format_version": 1, "cards": [{"title": "без id"}]})
     assert r.status_code == 200
     assert isinstance(client.get(f"{API}/cards").json()[0]["id"], int)
 
 
 def test_import_reports_counts(client):
     payload = {"format_version": 1, "cards": [{"title": "а"}, {"title": "б"}]}
-    body = client.post(f"{API}/import", json=payload).json()
+    body = client.post(f"{API}/import", params={"mode": "replace"}, json=payload).json()
     assert body == {"mode": "replace", "imported_cards": 2, "total_cards": 2}
 
 
@@ -1043,7 +1043,7 @@ def test_import_preserves_comments_and_timestamps(client):
             }
         ],
     }
-    client.post(f"{API}/import", json=payload)
+    client.post(f"{API}/import", params={"mode": "replace"}, json=payload)
     card = client.get(f"{API}/cards/5").json()
     assert card["created_at"] == "2026-01-01T00:00:00Z"
     comments = client.get(f"{API}/cards/5/comments").json()
@@ -1056,7 +1056,7 @@ def test_round_trip_after_merge_is_still_valid(client):
     client.post(f"{API}/import", params={"mode": "merge"}, json=exported)
     again = client.get(f"{API}/export").json()
     assert len(again["cards"]) == 2
-    assert client.post(f"{API}/import", json=again).status_code == 200
+    assert client.post(f"{API}/import", params={"mode": "replace"}, json=again).status_code == 200
 
 
 # --- защита от мусорного импорта (ревью PR #45: Agent-2 и лид) ---
@@ -1081,7 +1081,7 @@ def test_garbage_import_never_wipes_board(client, body):
     make_card(client, title="не должна пропасть")
     before = client.get(f"{API}/cards").json()
 
-    r = client.post(f"{API}/import", json=body)
+    r = client.post(f"{API}/import", params={"mode": "replace"}, json=body)
 
     assert r.status_code == 422, f"тело {body!r} обязано быть отвергнуто"
     assert isinstance(r.json()["detail"], str)
@@ -1091,7 +1091,7 @@ def test_garbage_import_never_wipes_board(client, body):
 @pytest.mark.parametrize("bad", ["не массив", 42, {"id": 1}, None])
 def test_import_rejects_non_list_cards(client, bad):
     make_card(client, title="цела")
-    r = client.post(f"{API}/import", json={"format_version": 1, "cards": bad})
+    r = client.post(f"{API}/import", params={"mode": "replace"}, json={"format_version": 1, "cards": bad})
     assert r.status_code == 422
     assert len(client.get(f"{API}/cards").json()) == 1
 
@@ -1099,5 +1099,13 @@ def test_import_rejects_non_list_cards(client, bad):
 def test_explicit_empty_cards_still_clears_board(client):
     """Явное `"cards": []` — осознанная команда очистить, она остаётся легальной."""
     make_card(client, title="уйдёт по явной команде")
-    r = client.post(f"{API}/import", json={"format_version": 1, "cards": []})
+    r = client.post(f"{API}/import", params={"mode": "replace"}, json={"format_version": 1, "cards": []})
     assert r.status_code == 200 and client.get(f"{API}/cards").json() == []
+
+
+def test_import_requires_explicit_mode(client):
+    """Стирание доски не должно случаться из-за забытого параметра (ревью #45)."""
+    make_card(client, title="цела без mode")
+    r = client.post(f"{API}/import", json={"format_version": 1, "cards": []})
+    assert r.status_code == 422
+    assert len(client.get(f"{API}/cards").json()) == 1
