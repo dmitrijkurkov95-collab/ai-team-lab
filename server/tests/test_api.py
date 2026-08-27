@@ -506,6 +506,94 @@ def test_comments_order_stable_within_same_second(client):
     assert listed == texts
 
 
+# ------------------------------------------------------------- пагинация (#27)
+
+
+def test_offset_skips_first_cards(client):
+    for i in range(5):
+        make_card(client, title=f"карточка {i}")
+    all_ids = [c["id"] for c in client.get(f"{API}/cards").json()]
+    got = client.get(f"{API}/cards", params={"offset": 2}).json()
+    assert [c["id"] for c in got] == all_ids[2:]
+
+
+def test_offset_with_limit_gives_page(client):
+    for i in range(10):
+        make_card(client, title=f"карточка {i}")
+    all_ids = [c["id"] for c in client.get(f"{API}/cards").json()]
+    page2 = client.get(f"{API}/cards", params={"limit": 3, "offset": 3}).json()
+    assert [c["id"] for c in page2] == all_ids[3:6]
+
+
+def test_pages_cover_collection_without_gaps(client):
+    """Страницы подряд дают ровно исходный список — без дыр и повторов."""
+    for i in range(7):
+        make_card(client, title=f"карточка {i}")
+    expected = [c["id"] for c in client.get(f"{API}/cards").json()]
+    collected: list[int] = []
+    for offset in range(0, 9, 3):
+        page = client.get(f"{API}/cards", params={"limit": 3, "offset": offset}).json()
+        collected += [c["id"] for c in page]
+    assert collected == expected
+
+
+def test_offset_beyond_collection_is_200_and_empty(client):
+    """Ушли за хвост — пустой список, а не 404: карточки могли удалить."""
+    make_card(client, title="единственная")
+    r = client.get(f"{API}/cards", params={"offset": 50})
+    assert r.status_code == 200 and r.json() == []
+
+
+def test_offset_zero_equals_no_offset(client):
+    for i in range(3):
+        make_card(client, title=f"карточка {i}")
+    assert client.get(f"{API}/cards", params={"offset": 0}).json() == client.get(f"{API}/cards").json()
+
+
+@pytest.mark.parametrize("offset", [-1, "abc", "", 1.5])
+def test_invalid_offset_422(client, offset):
+    assert client.get(f"{API}/cards", params={"offset": offset}).status_code == 422
+
+
+def test_offset_combines_with_filters(client):
+    for i in range(4):
+        make_card(client, title=f"высокий {i}", priority="high")
+    make_card(client, title="лишняя", priority="low")
+    got = client.get(f"{API}/cards", params={"priority": "high", "limit": 2, "offset": 2}).json()
+    assert len(got) == 2 and all(c["priority"] == "high" for c in got)
+
+
+def test_total_count_ignores_offset(client):
+    """X-Total-Count — размер выборки под фильтром, offset его не двигает."""
+    for i in range(6):
+        make_card(client, title=f"карточка {i}")
+    r = client.get(f"{API}/cards", params={"limit": 2, "offset": 4})
+    assert r.headers["X-Total-Count"] == "6" and len(r.json()) == 2
+
+
+def test_offset_has_no_ceiling_unlike_limit(client):
+    """Потолок нужен limit (защита ответа), offset ограничивать нечем — он не грузит выдачу."""
+    make_card(client, title="одна")
+    assert client.get(f"{API}/cards", params={"offset": 100000}).status_code == 200
+
+
+def test_insert_between_pages_shifts_tail_by_design(client):
+    """Честная слабость offset: вставка в начало сдвигает хвост, элемент повторится.
+
+    Тест фиксирует поведение, а не притворяется, что его нет: карточки создаются
+    с возрастающим id, поэтому вставка попадает в конец и страницы не едут.
+    А вот удаление из начала сдвигает окно — это и проверяем.
+    """
+    for i in range(6):
+        make_card(client, title=f"карточка {i}")
+    ids = [c["id"] for c in client.get(f"{API}/cards").json()]
+    page1 = client.get(f"{API}/cards", params={"limit": 3, "offset": 0}).json()
+    client.delete(f"{API}/cards/{ids[0]}")  # удалили из уже показанной страницы
+    page2 = client.get(f"{API}/cards", params={"limit": 3, "offset": 3}).json()
+    # элемент ids[3] уже уехал в первую страницу — клиент его пропустит
+    assert [c["id"] for c in page1] == ids[:3]
+    assert ids[3] not in [c["id"] for c in page2]
+
 # ---------------------------------------------------------------- поиск (#30)
 
 
@@ -594,3 +682,31 @@ def test_total_count_respects_search(client):
 
 def test_search_too_long_is_422(client):
     assert client.get(f"{API}/cards", params={"q": "я" * 201}).status_code == 422
+
+
+def test_search_combines_with_pagination(client):
+    """Критерий #30: поиск и пагинация (#27) работают вместе.
+
+    Страницы внутри результата поиска не пересекаются и покрывают его целиком,
+    а X-Total-Count считает совпадения, а не всю доску.
+    """
+    for i in range(7):
+        make_card(client, title=f"Дизайн {i}")
+    make_card(client, title="Мимо кассы")
+
+    found = client.get(f"{API}/cards", params={"q": "дизайн"})
+    assert found.headers["X-Total-Count"] == "7"
+    expected = [c["id"] for c in found.json()]
+
+    collected: list[int] = []
+    for offset in range(0, 9, 3):
+        page = client.get(f"{API}/cards", params={"q": "дизайн", "limit": 3, "offset": offset})
+        assert page.headers["X-Total-Count"] == "7", "счётчик должен считать совпадения, а не всю доску"
+        collected += [c["id"] for c in page.json()]
+    assert collected == expected
+
+
+def test_search_with_offset_beyond_matches_is_empty(client):
+    make_card(client, title="Единственное совпадение")
+    r = client.get(f"{API}/cards", params={"q": "совпадение", "offset": 10})
+    assert r.status_code == 200 and r.json() == [] and r.headers["X-Total-Count"] == "1"

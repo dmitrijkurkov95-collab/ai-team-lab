@@ -163,12 +163,17 @@ class Storage:
         status: Optional[str] = None,
         priority: Optional[str] = None,
         limit: Optional[int] = None,
+        offset: Optional[int] = None,
         q: Optional[str] = None,
     ) -> list[dict[str, Any]]:
         """Список карточек с опциональными фильтрами.
 
         Лимит применяется после сортировки по id, чтобы «первые N» были
         стабильны между запросами, а не зависели от порядка в файле БД.
+
+        `offset` пропускает первые N строк той же отсортированной выборки.
+        SQLite не принимает OFFSET без LIMIT, поэтому при `offset` без `limit`
+        подставляем `LIMIT -1` — документированный способ сказать «без предела».
 
         `q` — поиск подстроки в title и description, регистронезависимый
         и для кириллицы (через ulower, см. _connect).
@@ -177,9 +182,12 @@ class Storage:
         where, args = self._filters(status, priority, q)
         sql += where
         sql += " ORDER BY id ASC"  # контракт: по возрастанию id
-        if limit is not None:
+        if limit is not None or offset:
             sql += " LIMIT ?"
-            args.append(limit)
+            args.append(limit if limit is not None else -1)
+        if offset:
+            sql += " OFFSET ?"
+            args.append(offset)
         with self._connect() as conn:
             return [dict(r) for r in conn.execute(sql, args)]
 
