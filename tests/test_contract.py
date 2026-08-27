@@ -13,7 +13,19 @@ from contract_checks import assert_404_string_detail, assert_422_shape
 
 STATUSES = {"backlog", "in_progress", "review", "done"}
 PRIORITIES = {"low", "normal", "high"}
-CARD_KEYS = {"id", "title", "description", "status", "priority", "created_at", "updated_at"}
+# deadline добавлен в контракт в #31 (nullable). Правка минимальная и только в
+# этой константе: файл — зона Agent-3, в его тесты не лезу. Проверки поведения
+# дедлайна и сортировки со стороны контракт-сьюта — за автором зоны.
+CARD_KEYS = {
+    "id",
+    "title",
+    "description",
+    "status",
+    "priority",
+    "created_at",
+    "updated_at",
+    "deadline",
+}
 # ISO 8601 UTC. Дробная секунда допустима стандартом, но пример в контракте без неё —
 # это разбирается отдельно в тесте ниже, помеченном gap.
 ISO_UTC = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$")
