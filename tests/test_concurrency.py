@@ -51,6 +51,13 @@ CARDS = 30
 # занятом раннере — это шум, а поток ошибок означает, что сервер не справляется.
 # Порог в долях от общего числа запросов.
 TRANSPORT_TOLERANCE = 0.01
+
+# 503 «база занята» — штатный ответ, а не ошибка сервера (#47/#48): клиент
+# обязан повторить по Retry-After, и очередь фронта это умеет (#50).
+# Требовать ноль нельзя — это природа однофайловой SQLite под нагрузкой;
+# но поток таких ответов означает, что нагрузка переросла хранилище.
+# Порог тот же приём, что и для транспортного шума: терпим, но считаем.
+BUSY_TOLERANCE = 0.01
 LOAD_TIMEOUT = 30.0
 
 
@@ -127,23 +134,29 @@ def test_параллельные_запросы_не_отдают_5xx(stack_api
         for _ in range(BURSTS):
             res = _one_burst(client, ids, new_ids, lock)
             all_results.extend(res)
-            per_burst.append(sum(1 for _, code in res if code >= 500 or code == -1))
+            per_burst.append(
+                sum(1 for _, code in res if (code >= 500 and code != 503) or code == -1)
+            )
 
     created.extend(new_ids)  # уборка за собой: фикстура удалит их в teardown
 
     # Три разных сигнала, и путать их нельзя:
     #  - 5xx          — сервер ответил ошибкой, это баг, терпим ноль;
+    #  - 503 «занято»  — штатный ответ под нагрузкой, терпим до порога;
     #  - ложный 404   — существующая карточка отдана как отсутствующая, тоже баг;
     #  - транспорт    — запрос не дошёл, на общем раннере бывает, терпим до порога.
-    fivexx = [(k, c) for k, c in all_results if c >= 500]
+    fivexx = [(k, c) for k, c in all_results if c >= 500 and c != 503]
+    busy = [(k, c) for k, c in all_results if c == 503]
     transport = [(k, c) for k, c in all_results if c == -1]
     false_404 = [(k, c) for k, c in all_results if k == "GET_CARD" and c == 404]
     transport_limit = int(len(all_results) * TRANSPORT_TOLERANCE)
+    busy_limit = int(len(all_results) * BUSY_TOLERANCE)
 
     detail = (
         f"\nвсего запросов: {len(all_results)} ({BURSTS} заходов по {REQUESTS_PER_BURST}, {WORKERS} потоков)"
         f"\nпровалов по заходам: {per_burst}"
         f"\n5xx (сервер ответил ошибкой): {len(fivexx)}, виды: {sorted({k for k, _ in fivexx})}"
+        f"\n503 (база занята, штатно): {len(busy)}, допуск {busy_limit}"
         f"\nтранспорт (запрос не дошёл): {len(transport)}, допуск {transport_limit}"
         f"\nложных 404 на существующих карточках: {len(false_404)}"
         f"\n\nТест вероятностный: ~92% поимки на заведомо багованном коде."
@@ -151,6 +164,10 @@ def test_параллельные_запросы_не_отдают_5xx(stack_api
     )
     assert not fivexx, f"под конкурентной нагрузкой сервер отдаёт 5xx{detail}"
     assert not false_404, f"существующие карточки отдаются как 404 — симптом гонки курсора{detail}"
+    assert len(busy) <= busy_limit, (
+        f"слишком много 503 «база занята» — очередь писателей не рассасывается, "
+        f"нагрузка переросла SQLite{detail}"
+    )
     assert len(transport) <= transport_limit, (
         f"транспортных ошибок больше допуска — сервер не справляется с нагрузкой, "
         f"это уже не шум раннера{detail}"
