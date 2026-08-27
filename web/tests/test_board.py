@@ -52,7 +52,16 @@ def page(browser):
     pg.goto(WEB_URL, wait_until="networkidle")
     pg.wait_for_timeout(700)
     pg.console_errors = errors  # type: ignore[attr-defined]
+    # Реестр карточек, созданных тестом: без уборки прогон оставляет мусор
+    # на общей доске (conflict-409, retry-after и прочие технические заголовки).
+    # Тот же приём, что в контракт-сьюте tests/conftest.py.
+    pg.created_cards = []  # type: ignore[attr-defined]
     yield pg
+    for card_id in getattr(pg, "created_cards", []):
+        try:
+            pg.request.delete(f"{WEB_URL}/api/v1/cards/{card_id}")
+        except Exception as e:  # сеть отвалилась — не роняем тест, но не молчим
+            print(f"\n[teardown] не смог удалить карточку {card_id}: {e}")
     pg.close()
 
 
@@ -297,6 +306,7 @@ def test_удаление_карточки_с_комментариями_пре�
     page.on("dialog", lambda d: (messages.append(d.message), d.dismiss()))
 
     created = page.request.post(f"{WEB_URL}/api/v1/cards", data={"title": "с обсуждением"}).json()
+    page.created_cards.append(created["id"])  # страховка: тест удаляет сам, но если упадёт раньше
     for text in ("раз", "два", "три"):
         page.request.post(f"{WEB_URL}/api/v1/cards/{created['id']}/comments", data={"text": text})
     page.reload(wait_until="networkidle")
@@ -321,6 +331,7 @@ def test_удаление_карточки_без_комментариев_не_
     page.on("dialog", lambda d: (messages.append(d.message), d.dismiss()))
 
     created = page.request.post(f"{WEB_URL}/api/v1/cards", data={"title": "простая карточка"}).json()
+    page.created_cards.append(created["id"])  # страховка: тест удаляет сам, но если упадёт раньше
     page.reload(wait_until="networkidle")
     page.wait_for_timeout(1200)
 
@@ -422,6 +433,7 @@ def make_card(page, title="conflict-test", status="backlog"):
     )
     assert created.status == 201, created.text()
     card_id = str(created.json()["id"])
+    getattr(page, "created_cards", []).append(card_id)  # уборка в teardown фикстуры
     page.reload(wait_until="networkidle")
     page.wait_for_timeout(700)
     page.wait_for_selector(f'article.card[data-id="{card_id}"]')
@@ -594,6 +606,7 @@ def test_доска_сама_подхватывает_чужие_карточк�
     )
     assert created.status == 201
     card_id = created.json()["id"]
+    page.created_cards.append(card_id)  # уборка в teardown фикстуры
 
     # интервал опроса 10 с — ждём с запасом на медленный раннер
     page.wait_for_selector(f'article.card[data-id="{card_id}"]', timeout=20000)
