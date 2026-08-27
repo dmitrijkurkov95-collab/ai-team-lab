@@ -1057,3 +1057,47 @@ def test_round_trip_after_merge_is_still_valid(client):
     again = client.get(f"{API}/export").json()
     assert len(again["cards"]) == 2
     assert client.post(f"{API}/import", json=again).status_code == 200
+
+
+# --- защита от мусорного импорта (ревью PR #45: Agent-2 и лид) ---
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},                                    # пустой объект
+        {"мусор": True},                       # чужой формат
+        {"cards": [{"title": "есть"}]},        # нет format_version
+        {"format_version": 1},                 # нет cards
+    ],
+)
+def test_garbage_import_never_wipes_board(client, body):
+    """Мусорное тело обязано дать 422 и не тронуть доску.
+
+    Раньше `format_version` и `cards` имели значения по умолчанию, поэтому
+    поля не были обязательными: `{}` проходил валидацию, трактовался как
+    «заменить доску на пустую» и молча стирал всё с ответом 200.
+    """
+    make_card(client, title="не должна пропасть")
+    before = client.get(f"{API}/cards").json()
+
+    r = client.post(f"{API}/import", json=body)
+
+    assert r.status_code == 422, f"тело {body!r} обязано быть отвергнуто"
+    assert isinstance(r.json()["detail"], str)
+    assert client.get(f"{API}/cards").json() == before, "доска не должна меняться"
+
+
+@pytest.mark.parametrize("bad", ["не массив", 42, {"id": 1}, None])
+def test_import_rejects_non_list_cards(client, bad):
+    make_card(client, title="цела")
+    r = client.post(f"{API}/import", json={"format_version": 1, "cards": bad})
+    assert r.status_code == 422
+    assert len(client.get(f"{API}/cards").json()) == 1
+
+
+def test_explicit_empty_cards_still_clears_board(client):
+    """Явное `"cards": []` — осознанная команда очистить, она остаётся легальной."""
+    make_card(client, title="уйдёт по явной команде")
+    r = client.post(f"{API}/import", json={"format_version": 1, "cards": []})
+    assert r.status_code == 200 and client.get(f"{API}/cards").json() == []

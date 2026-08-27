@@ -209,12 +209,22 @@ class CardExport(BaseModel):
 
 
 class BoardImport(BaseModel):
-    """Файл обмена целиком."""
+    """Файл обмена целиком.
+
+    Оба поля обязательные и **без значений по умолчанию** — это защита от
+    потери данных, а не формальность. Со значением по умолчанию поле перестаёт
+    быть обязательным: тело `{}` проходило валидацию, превращалось в
+    «замени доску на пустую» и молча стирало всё, отвечая `200 OK`
+    (найдено на ревью PR #45 — Agent-2 по `format_version`, лид по `cards`).
+
+    Пустая доска остаётся легальной, но только как явное `"cards": []`:
+    это осознанная команда, а не молчание.
+    """
 
     model_config = ConfigDict(extra="ignore")
 
-    format_version: int = EXPORT_FORMAT_VERSION
-    cards: list[CardExport] = Field(default_factory=list)
+    format_version: int
+    cards: list[CardExport]
 
     @field_validator("format_version")
     @classmethod
