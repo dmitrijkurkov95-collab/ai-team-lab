@@ -214,7 +214,13 @@ def test_при_обрыве_сети_правка_копится_а_не_тер
     page.wait_for_function("() => window.__kanban.queue.size === 1", timeout=10000)
 
     assert column_of(page, card_id) == target, "карточка должна остаться в новой колонке"
-    assert page.get_attribute("#sync-indicator", "data-state") == "pending"
+    # Между попытками индикатор кратко показывает `syncing` — очередь как раз
+    # повторяет операцию. Ждём паузы между повторами, иначе проверка ловит
+    # случайную фазу цикла и мигает красным на ровном месте.
+    page.wait_for_function(
+        "() => document.getElementById('sync-indicator').dataset.state === 'pending'",
+        timeout=10000,
+    )
     assert _queue_size(page) == 1
     assert page.locator("#btn-retry").is_visible()
 
