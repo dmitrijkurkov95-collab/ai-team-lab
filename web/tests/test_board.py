@@ -757,3 +757,103 @@ def test_прокси_отвечает_на_битый_запрос_а_не_па
 
     # и остаться живым для следующих запросов
     assert page.request.get(f"{WEB_URL}/api/v1/cards").status == 200
+
+
+def test_503_переигрывается_очередью_а_не_пугает_пользователя(page):
+    """Сервер занят другим писателем (#47) — это «повтори», а не «сломалось».
+
+    Бэкенд специально отдаёт `503` вместо `500`, рассчитывая, что очередь
+    правок такие ответы переигрывает. Проверяем, что расчёт верен: молчаливая
+    регрессия здесь означала бы потерянную правку под нагрузкой.
+    """
+    import json as _json
+
+    card_id = make_card(page, "busy-503")
+    origin = column_of(page, card_id)
+    target = next(s for s in ("done", "review", "in_progress") if s != origin)
+
+    attempts = {"n": 0}
+
+    def busy(route):
+        if route.request.method == "PATCH":
+            attempts["n"] += 1
+            if attempts["n"] <= 2:  # первые две попытки — база занята
+                route.fulfill(
+                    status=503,
+                    content_type="application/json",
+                    headers={"Retry-After": "1", "Access-Control-Allow-Origin": "*"},
+                    body=_json.dumps({"detail": "База временно занята другой записью"}),
+                )
+                return
+        route.continue_()
+
+    page.route("**/api/v1/cards/**", busy)
+    page.evaluate(DRAG_SNIPPET, [card_id, target])
+    page.wait_for_timeout(1500)
+
+    assert page.evaluate("window.__kanban.queue.size") >= 1, "503 не должен выбрасывать правку"
+    assert column_of(page, card_id) == target
+
+    page.wait_for_function("() => window.__kanban.queue.size === 0", timeout=15000)
+    assert attempts["n"] >= 3, f"должны были быть повторы, а было попыток: {attempts['n']}"
+
+    server_status = page.request.get(f"{WEB_URL}/api/v1/cards/{card_id}").json()["status"]
+    assert server_status == target, "после повторов правка обязана дойти"
+
+    errors = " ".join(page.locator("#toasts .toast.error").all_inner_texts())
+    assert "не удалось" not in errors.lower(), (
+        f"временная занятость базы — не повод пугать пользователя: {errors}"
+    )
+
+
+def test_retry_after_с_сервера_важнее_собственного_backoff(page):
+    """503 приходит с Retry-After — сервер называет паузу сам.
+
+    Игнорировать её и гадать своим backoff значит либо долбить занятую базу
+    раньше времени, либо ждать дольше, чем нужно.
+    """
+    parsed = page.evaluate(
+        """async () => {
+          const m = await import('/api.js');
+          const before = performance.now();
+          try {
+            // сервер отвечает 503 с Retry-After — проверяем, что клиент его прочитал
+            await m.updateCard(999999, {status: 'done'});
+            return {error: 'ожидали отказ'};
+          } catch (e) {
+            return {status: e.status, retryAfterMs: e.retryAfterMs, name: e.name};
+          }
+        }"""
+    )
+    # На живом сервере карточки нет — придёт 404 без Retry-After, поле должно быть null,
+    # а не undefined: контракт объекта ошибки обязан быть стабильным.
+    assert parsed["name"] == "ApiError"
+    assert parsed["retryAfterMs"] is None, f"без заголовка ожидаем null: {parsed}"
+
+
+def test_очередь_ждёт_столько_сколько_просил_сервер(page):
+    """Retry-After: 2 → пауза перед повтором берётся из заголовка, а не 1 с."""
+    import json as _json
+
+    card_id = make_card(page, "retry-after")
+    origin = column_of(page, card_id)
+    target = next(s for s in ("done", "review", "in_progress") if s != origin)
+
+    def busy(route):
+        if route.request.method == "PATCH":
+            route.fulfill(
+                status=503,
+                content_type="application/json",
+                headers={"Retry-After": "2", "Access-Control-Allow-Origin": "*"},
+                body=_json.dumps({"detail": "занято"}),
+            )
+        else:
+            route.continue_()
+
+    page.route("**/api/v1/cards/**", busy)
+    page.evaluate(DRAG_SNIPPET, [card_id, target])
+    page.wait_for_timeout(1500)
+
+    delay = page.evaluate("window.__kanban.queue.retryAfterMs")
+    assert delay == 2000, f"пауза должна прийти из Retry-After: {delay}"
+    assert page.evaluate("window.__kanban.queue.size") >= 1
