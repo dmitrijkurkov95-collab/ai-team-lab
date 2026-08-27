@@ -71,3 +71,40 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m compileall -q web
+      # compileall проверяет только Python (serve.py). Основной код доски —
+      # JS-модули, и до сих пор их не проверял никто: опечатка в app.js
+      # проходила CI и ломалась уже в браузере.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      # ВАЖНО: node --check file.js разбирает файл как CommonJS и пропускает
+      # ошибки в ES-модулях. Читаем модуль на stdin с явным --input-type=module.
+      - run: |
+          for f in web/api.js web/app.js web/sync.js web/poll.js; do
+            node --input-type=module --check < "$f" || { echo "синтаксис: $f"; exit 1; }
+          done
+
+  web-ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r server/requirements.txt pytest playwright
+      - run: python -m playwright install --with-deps chromium
+      - name: поднять стенд и прогнать UI-тесты
+        run: |
+          # Отдельная база: UI-тесты создают и удаляют карточки.
+          (cd server && KANBAN_DB=/tmp/ui-ci.db nohup python run.py >/tmp/api.log 2>&1 &)
+          (cd web && nohup python serve.py --port 5173 >/tmp/web.log 2>&1 &)
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:5173/api/v1/cards >/dev/null && break
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:5173/api/v1/cards >/dev/null || {
+            echo 'стенд не поднялся'; tail -40 /tmp/api.log /tmp/web.log; exit 1; }
+          KANBAN_WEB=http://127.0.0.1:5173 python -m pytest web/tests -q
+      - name: логи стенда при падении
+        if: failure()
+        run: tail -60 /tmp/api.log /tmp/web.log
