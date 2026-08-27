@@ -116,6 +116,30 @@ def _humanize(error: dict) -> str:
     return f"{field}: {msg}" if field else msg
 
 
+class ContractError(HTTPException):
+    """Ручной отказ, который обязан выглядеть как валидационный.
+
+    Контракт задаёт форму `422` для кода целиком, без оговорок про источник:
+    `{"detail": "<строка>", "errors": [<подробности>]}`. Но `errors` добавлял
+    только обработчик RequestValidationError, а отказы, написанные руками через
+    HTTPException, отдавали голый `detail` — два разных формата под одним кодом
+    (находка контракт-сьюта #61).
+
+    Это та же болезнь, что чинил PR #8, только наоборот: тогда `detail` был
+    массивом у всех, теперь `errors` отсутствовал у части ответов. Клиенту,
+    который по контракту читает `errors`, снова пришлось бы гадать.
+    """
+
+    def __init__(self, detail: str, errors: Optional[list[dict]] = None) -> None:
+        super().__init__(status_code=422, detail=detail)
+        self.errors = errors or [{"type": "contract_violation", "msg": detail}]
+
+
+@app.exception_handler(ContractError)
+async def contract_error_handler(request: Request, exc: ContractError) -> JSONResponse:
+    return JSONResponse(status_code=422, content={"detail": exc.detail, "errors": exc.errors})
+
+
 @app.exception_handler(StorageBusy)
 async def storage_busy_handler(request: Request, exc: StorageBusy) -> JSONResponse:
     """База занята другим писателем — это 503, а не 500.
@@ -387,16 +411,29 @@ def import_board(
 
     cards = [card.model_dump() for card in payload.cards]
 
+    # Дубли id внутри файла — ошибка самого файла, а не режима импорта.
+    # Проверка стоит ДО ветвления: контракт обещает 422 для импорта вообще,
+    # и клиент не должен получать разный ответ на один и тот же кривой файл
+    # в зависимости от mode (находка контракт-сьюта #61).
+    #
+    # В merge id из файла всё равно отбрасываются, то есть коллизии в базе не
+    # будет — но принимать заведомо противоречивый документ молча значит
+    # скрывать от клиента, что его файл испорчен.
+    ids = [c["id"] for c in cards if c["id"] is not None]
+    duplicates = {i for i in ids if ids.count(i) > 1}
+    if duplicates:
+        raise ContractError(
+            f"duplicate card ids in file: {sorted(duplicates)}",
+            [
+                {
+                    "type": "duplicate_id",
+                    "loc": ("body", "cards"),
+                    "msg": f"id встречается больше одного раза: {sorted(duplicates)}",
+                }
+            ],
+        )
+
     if mode == "replace":
-        # Дубли id внутри самого файла ловим до записи: иначе UNIQUE-нарушение
-        # прилетело бы из SQLite пятисотым, а это ошибка данных, то есть 422.
-        ids = [c["id"] for c in cards if c["id"] is not None]
-        duplicates = {i for i in ids if ids.count(i) > 1}
-        if duplicates:
-            raise HTTPException(
-                status_code=422,
-                detail=f"duplicate card ids in file: {sorted(duplicates)}",
-            )
         now = utcnow()
         next_id = (max(ids) if ids else 0) + 1
         for card in cards:
