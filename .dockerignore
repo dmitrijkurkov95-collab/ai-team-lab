@@ -1,0 +1,17 @@
+# Не тащим в контекст сборки лишнее: чужие базы, кеши и историю git.
+# Иначе локальная kanban.db уехала бы внутрь образа поверх volume.
+.git/
+data/
+**/__pycache__/
+**/*.pyc
+**/*.db
+**/*.db-wal
+**/*.db-shm
+.pytest_cache/
+tests/
+tests_e2e/
+web/tests/
+server/tests/
+*.md
+docs/
+.github/
