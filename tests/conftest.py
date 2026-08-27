@@ -51,6 +51,13 @@ def created():
 
 
 @pytest.fixture()
+def stack_api():
+    """Base URL API. Отдельная фикстура, чтобы нагрузочный тест мог завести
+    собственный клиент с другим таймаутом, не трогая общий `client`."""
+    return API
+
+
+@pytest.fixture()
 def client(created):
     """HTTP-клиент. В teardown убираем созданные тестом карточки и говорим, если не вышло."""
     with httpx.Client(base_url=API, timeout=10) as c:
