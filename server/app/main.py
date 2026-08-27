@@ -133,6 +133,11 @@ def list_cards(
         le=MAX_LIMIT,
         description=f"сколько карточек вернуть, 1…{MAX_LIMIT}; без параметра — все",
     ),
+    offset: Optional[int] = Query(
+        default=None,
+        ge=0,
+        description="сколько карточек пропустить от начала выборки; без параметра — 0",
+    ),
     store: Storage = Depends(get_storage),
 ) -> list[dict]:
     """Список карточек. Фильтры комбинируются, лимит применяется после сортировки.
@@ -142,14 +147,20 @@ def list_cards(
     что интерфейс показывает неполную доску, не сообщая об этом. Ровно за это
     я отказался молча обрезать limit>потолка — принцип должен работать и здесь.
 
-    Заголовок X-Total-Count отдаёт полное число карточек под фильтром, чтобы
-    клиент мог обнаружить урезание, не угадывая.
+    Заголовок X-Total-Count отдаёт полное число карточек под фильтром — без
+    учёта и limit, и offset. Он остаётся якорем «сколько всего есть»: по нему
+    клиент считает число страниц и видит, что выдача урезана, не угадывая.
+
+    `offset` за пределами выборки — это `200` и пустой список, а не `404`:
+    хвост страницы, с которого карточки успели удалить, не ошибка клиента.
     """
     status_value = status.value if status else None
     priority_value = priority.value if priority else None
     total = store.count_cards(status=status_value, priority=priority_value)
     response.headers["X-Total-Count"] = str(total)
-    return store.list_cards(status=status_value, priority=priority_value, limit=limit)
+    return store.list_cards(
+        status=status_value, priority=priority_value, limit=limit, offset=offset
+    )
 
 
 @app.post(
