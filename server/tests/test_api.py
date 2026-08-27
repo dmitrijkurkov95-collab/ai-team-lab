@@ -890,3 +890,100 @@ def test_existing_database_gets_deadline_column(tmp_path):
     cards = store.list_cards()
     assert len(cards) == 1 and cards[0]["deadline"] is None
     store.close()
+
+
+# --------------------------- занятая база под нагрузкой (#47)
+
+
+def test_busy_database_waits_and_succeeds(tmp_path):
+    """Короткая блокировка должна пережидаться, а не превращаться в ошибку."""
+    import sqlite3
+    import threading
+    import time
+
+    db = tmp_path / "busy.db"
+    store = Storage(str(db))
+    store.create_card("исходная", "", "backlog", "normal")
+
+    blocker = sqlite3.connect(db, timeout=1.0)
+    blocker.execute("BEGIN IMMEDIATE")
+    blocker.execute(
+        "INSERT INTO cards (title, description, status, priority, created_at, updated_at)"
+        " VALUES ('lock','','backlog','normal','t','t')"
+    )
+
+    result = {}
+
+    def write():
+        try:
+            result["card"] = store.create_card("дождалась", "", "backlog", "normal")
+        except Exception as exc:  # noqa: BLE001
+            result["error"] = exc
+
+    worker = threading.Thread(target=write)
+    worker.start()
+    time.sleep(1.5)  # держим заметно меньше BUSY_TIMEOUT
+    blocker.rollback()
+    blocker.close()
+    worker.join(timeout=30)
+
+    assert "error" not in result, f"ожидание не сработало: {result.get('error')}"
+    assert result["card"]["title"] == "дождалась"
+    store.close()
+
+
+def test_exhausted_wait_raises_storage_busy_not_generic_error(tmp_path, monkeypatch):
+    """Исчерпанное ожидание — StorageBusy (→503), а не голый OperationalError (→500).
+
+    Именно этот путь ронял qa-load: клиент получал 500 на обычную очередь
+    писателей и считал сервер сломанным.
+    """
+    import sqlite3
+
+    from app import storage as storage_module
+
+    monkeypatch.setattr(storage_module, "BUSY_TIMEOUT", 0.3)
+
+    db = tmp_path / "busy2.db"
+    store = Storage(str(db))
+    store.create_card("исходная", "", "backlog", "normal")
+
+    blocker = sqlite3.connect(db, timeout=1.0)
+    blocker.execute("BEGIN IMMEDIATE")
+    blocker.execute(
+        "INSERT INTO cards (title, description, status, priority, created_at, updated_at)"
+        " VALUES ('lock','','backlog','normal','t','t')"
+    )
+    try:
+        with pytest.raises(storage_module.StorageBusy):
+            store.create_card("не пройдёт", "", "backlog", "normal")
+    finally:
+        blocker.rollback()
+        blocker.close()
+        store.close()
+
+
+def test_busy_storage_returns_503_with_retry_after(client, monkeypatch):
+    """HTTP-слой переводит StorageBusy в 503 + Retry-After, а не в 500."""
+    from app import storage as storage_module
+
+    def busy(*args, **kwargs):
+        raise storage_module.StorageBusy("database is locked")
+
+    monkeypatch.setattr(Storage, "create_card", busy)
+    r = client.post(f"{API}/cards", json={"title": "во время блокировки"})
+
+    assert r.status_code == 503
+    assert r.headers["Retry-After"] == "1"
+    assert isinstance(r.json()["detail"], str)
+
+
+def test_wal_mode_is_actually_enabled(tmp_path):
+    """WAL обязан быть включён: без него читатели блокируют писателя."""
+    import sqlite3
+
+    db = tmp_path / "wal.db"
+    store = Storage(str(db))
+    with sqlite3.connect(db) as probe:
+        assert probe.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+    store.close()
