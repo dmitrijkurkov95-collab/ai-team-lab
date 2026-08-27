@@ -707,3 +707,53 @@ def test_скрытая_вкладка_не_опрашивает_сервер(pa
         }"""
     )
     assert scheduled is False, "в скрытой вкладке таймер опроса не должен взводиться"
+
+
+# ------------------------------------------------- прокси дев-сервера
+
+
+def test_прокси_не_падает_на_сырой_кириллице_в_query(page):
+    """Сырые не-ASCII байты в query роняли прокси, а не запрос.
+
+    `http.client` кодирует строку запроса в ASCII: `?q=задача` без
+    процентного экранирования (curl, скрипты, ручная отладка) приводил к
+    `UnicodeEncodeError` и обрыву соединения. Браузер такое кодирует сам,
+    поэтому дыра не всплывала в UI-тестах — нашлась при ревью чужого PR.
+    """
+    r = page.request.get(f"{WEB_URL}/api/v1/cards?status=мусор")
+    assert r.status == 422, f"ожидали честный 422, получили {r.status}"
+    assert isinstance(r.json()["detail"], str)
+
+
+def test_прокси_сохраняет_кириллицу_без_искажения(page):
+    """Мало не упасть — нельзя и портить данные по дороге."""
+    title = "Уникальное слово черёмуха"
+    created = page.request.post(
+        f"{WEB_URL}/api/v1/cards",
+        data={"title": title},
+        headers={"Content-Type": "application/json"},
+    )
+    assert created.status == 201
+
+    found = page.request.get(f"{WEB_URL}/api/v1/cards?q=черёмуха").json()
+    assert any(c["title"] == title for c in found), (
+        f"поиск по кириллице через прокси должен находить карточку: {found}"
+    )
+    page.request.delete(f"{WEB_URL}/api/v1/cards/{created.json()['id']}")
+
+
+def test_прокси_отвечает_на_битый_запрос_а_не_падает(page):
+    """400 Bad request не должен превращаться в AttributeError.
+
+    `end_headers` обращался к `self.path`, которого при неразобранной
+    строке запроса ещё нет — обработчик падал вместо честного ответа.
+    """
+    import socket
+
+    with socket.create_connection(("localhost", 5173), timeout=5) as sock:
+        sock.sendall(b"GET /api/v1/cards?q=\xd0\xb7\xd0\xb0 \xff HTTP/1.1\r\nHost: x\r\n\r\n")
+        reply = sock.recv(256)
+    assert reply.startswith(b"HTTP/1."), f"сервер должен ответить, а не оборвать: {reply!r}"
+
+    # и остаться живым для следующих запросов
+    assert page.request.get(f"{WEB_URL}/api/v1/cards").status == 200
