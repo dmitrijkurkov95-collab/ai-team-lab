@@ -1,0 +1,45 @@
+# Весь стенд одной командой:
+#
+#     docker compose up
+#
+# Доска: http://localhost:5173 — и API, и статика с одного origin,
+# поэтому демо не зависит от CORS и проброса второго порта наружу.
+
+services:
+  api:
+    build: .
+    # Наружу не публикуем: в браузер ходит только web, а он проксирует /api.
+    # Меньше открытых портов — меньше вопросов «а почему 8000 торчит наружу».
+    expose:
+      - "8000"
+    environment:
+      KANBAN_DB: /data/kanban.db
+      KANBAN_PORT: "8000"
+    volumes:
+      # Данные переживают пересоздание контейнера — критерий из #34.
+      - kanban-data:/data
+    healthcheck:
+      # Стенд считается готовым по ответу API, а не по факту старта процесса:
+      # web стартует только после того, как бэкенд реально отвечает.
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=2).status==200 else 1)"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
+
+  web:
+    build: .
+    command: ["python", "web/serve.py", "--port", "5173"]
+    ports:
+      - "${PORT:-5173}:5173"
+    environment:
+      # Внутри сети compose бэкенд доступен по имени сервиса.
+      KANBAN_API: http://api:8000
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  kanban-data:
