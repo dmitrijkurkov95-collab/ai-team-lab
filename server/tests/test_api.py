@@ -890,3 +890,170 @@ def test_existing_database_gets_deadline_column(tmp_path):
     cards = store.list_cards()
     assert len(cards) == 1 and cards[0]["deadline"] is None
     store.close()
+
+
+# ------------------------------------------------- экспорт / импорт (#35)
+
+
+def test_export_has_version_and_cards(client):
+    make_card(client, title="карточка")
+    board = client.get(f"{API}/export").json()
+    assert board["format_version"] == 1
+    assert len(board["cards"]) == 1
+    assert board["exported_at"].endswith("Z")
+
+
+def test_export_includes_comments(client):
+    card = make_card(client, title="с комментарием")
+    client.post(f"{API}/cards/{card['id']}/comments", json={"text": "первый"})
+    board = client.get(f"{API}/export").json()
+    assert [c["text"] for c in board["cards"][0]["comments"]] == ["первый"]
+
+
+def test_export_empty_board(client):
+    board = client.get(f"{API}/export").json()
+    assert board["cards"] == []
+
+
+def test_round_trip_gives_equivalent_board(client):
+    """Критерий #35: экспорт → импорт → экспорт даёт эквивалентную доску."""
+    first = make_card(client, title="Первая", priority="high", deadline="2026-09-01T10:00:00Z")
+    client.post(f"{API}/cards/{first['id']}/comments", json={"text": "обсудили"})
+    client.post(f"{API}/cards/{first['id']}/comments", json={"text": "решили"})
+    make_card(client, title="Вторая", description="детали", status="done")
+
+    exported = client.get(f"{API}/export").json()
+    assert client.post(f"{API}/import", json=exported).status_code == 200
+    again = client.get(f"{API}/export").json()
+
+    # exported_at меняется по определению — сравниваем содержимое доски.
+    assert again["cards"] == exported["cards"]
+
+
+def test_replace_wipes_previous_board(client):
+    make_card(client, title="старая")
+    payload = {"format_version": 1, "cards": [{"id": 1, "title": "новая"}]}
+    client.post(f"{API}/import", json=payload)
+    titles = [c["title"] for c in client.get(f"{API}/cards").json()]
+    assert titles == ["новая"]
+
+
+def test_replace_preserves_ids(client):
+    payload = {"format_version": 1, "cards": [{"id": 77, "title": "с номером"}]}
+    client.post(f"{API}/import", json=payload)
+    assert client.get(f"{API}/cards").json()[0]["id"] == 77
+
+
+def test_new_card_after_replace_does_not_reuse_id(client):
+    """AUTOINCREMENT должен продолжить с максимума, иначе id столкнутся."""
+    client.post(f"{API}/import", json={"format_version": 1, "cards": [{"id": 50, "title": "а"}]})
+    fresh = make_card(client, title="следующая")
+    assert fresh["id"] > 50
+
+
+def test_merge_keeps_existing_and_adds_new(client):
+    make_card(client, title="своя")
+    payload = {"format_version": 1, "cards": [{"id": 1, "title": "пришедшая"}]}
+    r = client.post(f"{API}/import", params={"mode": "merge"}, json=payload)
+    assert r.status_code == 200
+    titles = sorted(c["title"] for c in client.get(f"{API}/cards").json())
+    assert titles == ["пришедшая", "своя"]
+
+
+def test_merge_does_not_overwrite_card_with_same_id(client):
+    """id из файла в merge не сохраняются — чужая карточка не должна пропасть."""
+    mine = make_card(client, title="моя важная")
+    client.post(
+        f"{API}/import",
+        params={"mode": "merge"},
+        json={"format_version": 1, "cards": [{"id": mine["id"], "title": "чужая"}]},
+    )
+    assert client.get(f"{API}/cards/{mine['id']}").json()["title"] == "моя важная"
+
+
+def test_import_rejects_unknown_format_version(client):
+    r = client.post(f"{API}/import", json={"format_version": 99, "cards": []})
+    assert r.status_code == 422 and isinstance(r.json()["detail"], str)
+
+
+def test_import_rejects_duplicate_ids_in_file(client):
+    payload = {"format_version": 1, "cards": [{"id": 1, "title": "а"}, {"id": 1, "title": "б"}]}
+    r = client.post(f"{API}/import", json=payload)
+    assert r.status_code == 422 and "duplicate" in r.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    "bad_card",
+    [
+        {"title": ""},
+        {"title": "   "},
+        {"title": "я" * 201},
+        {"title": "ок", "priority": "urgent"},
+        {"title": "ок", "status": "archived"},
+        {"title": "ок", "deadline": "вчера"},
+    ],
+)
+def test_import_validates_cards_like_post(client, bad_card):
+    """Импорт не должен быть дырой в обход обычной валидации."""
+    r = client.post(f"{API}/import", json={"format_version": 1, "cards": [bad_card]})
+    assert r.status_code == 422
+
+
+def test_failed_import_leaves_board_untouched(client):
+    """Атомарность: битый файл не оставляет половину доски."""
+    make_card(client, title="была до импорта")
+    before = client.get(f"{API}/cards").json()
+    client.post(
+        f"{API}/import",
+        json={"format_version": 1, "cards": [{"title": "хорошая"}, {"title": ""}]},
+    )
+    assert client.get(f"{API}/cards").json() == before
+
+
+def test_import_empty_board_clears_everything(client):
+    make_card(client, title="уйдёт")
+    client.post(f"{API}/import", json={"format_version": 1, "cards": []})
+    assert client.get(f"{API}/cards").json() == []
+
+
+def test_import_card_without_id_gets_one(client):
+    r = client.post(f"{API}/import", json={"format_version": 1, "cards": [{"title": "без id"}]})
+    assert r.status_code == 200
+    assert isinstance(client.get(f"{API}/cards").json()[0]["id"], int)
+
+
+def test_import_reports_counts(client):
+    payload = {"format_version": 1, "cards": [{"title": "а"}, {"title": "б"}]}
+    body = client.post(f"{API}/import", json=payload).json()
+    assert body == {"mode": "replace", "imported_cards": 2, "total_cards": 2}
+
+
+def test_import_preserves_comments_and_timestamps(client):
+    payload = {
+        "format_version": 1,
+        "cards": [
+            {
+                "id": 5,
+                "title": "с историей",
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-02T00:00:00Z",
+                "comments": [
+                    {"id": 1, "text": "старый", "created_at": "2026-01-01T12:00:00Z"}
+                ],
+            }
+        ],
+    }
+    client.post(f"{API}/import", json=payload)
+    card = client.get(f"{API}/cards/5").json()
+    assert card["created_at"] == "2026-01-01T00:00:00Z"
+    comments = client.get(f"{API}/cards/5/comments").json()
+    assert comments[0]["text"] == "старый" and comments[0]["created_at"] == "2026-01-01T12:00:00Z"
+
+
+def test_round_trip_after_merge_is_still_valid(client):
+    make_card(client, title="исходная")
+    exported = client.get(f"{API}/export").json()
+    client.post(f"{API}/import", params={"mode": "merge"}, json=exported)
+    again = client.get(f"{API}/export").json()
+    assert len(again["cards"]) == 2
+    assert client.post(f"{API}/import", json=again).status_code == 200
