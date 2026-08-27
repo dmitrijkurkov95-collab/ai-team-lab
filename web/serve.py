@@ -74,6 +74,16 @@ class Handler(SimpleHTTPRequestHandler):
         if ctype:
             req.add_header("Content-Type", ctype)
         req.add_header("Accept", self.headers.get("Accept", "application/json"))
+        # Заголовки протокола API пробрасываем как есть. Без этого защита из #54
+        # недоступна через прокси: X-Confirm-Replace терялся, и импорт с
+        # подтверждением получал 428 (напрямую в API — 200), а X-Auth-Token не
+        # доезжал, из-за чего доска не смогла бы работать с включённым токеном.
+        # Список явный, а не «все X-*»: пробрасывать вслепую чужие заголовки
+        # клиента на бэкенд — способ однажды переслать лишнее.
+        for name in ("X-Confirm-Replace", "X-Auth-Token"):
+            value = self.headers.get(name)
+            if value is not None:
+                req.add_header(name, value)
 
         try:
             with urllib.request.urlopen(req) as upstream:

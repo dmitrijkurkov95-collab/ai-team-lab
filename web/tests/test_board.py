@@ -857,3 +857,30 @@ def test_очередь_ждёт_столько_сколько_просил_се
     delay = page.evaluate("window.__kanban.queue.retryAfterMs")
     assert delay == 2000, f"пауза должна прийти из Retry-After: {delay}"
     assert page.evaluate("window.__kanban.queue.size") >= 1
+
+
+def test_прокси_пробрасывает_заголовок_подтверждения(page):
+    """Защита из #54 обязана работать и через прокси, а не только напрямую.
+
+    Прокси пересылал только Content-Type и Accept, поэтому X-Confirm-Replace
+    терялся: напрямую в API импорт с подтверждением давал 200, через прокси —
+    428. Доска ходит только через прокси, то есть подтверждённый импорт был
+    для неё недоступен в принципе.
+    """
+    board = page.request.get(f"{WEB_URL}/api/v1/export").json()
+
+    without = page.request.post(
+        f"{WEB_URL}/api/v1/import?mode=replace",
+        data=board,
+        headers={"Content-Type": "application/json"},
+    )
+    assert without.status == 428, "без подтверждения replace обязан отклоняться"
+
+    with_confirm = page.request.post(
+        f"{WEB_URL}/api/v1/import?mode=replace",
+        data=board,
+        headers={"Content-Type": "application/json", "X-Confirm-Replace": "yes"},
+    )
+    assert with_confirm.status == 200, (
+        f"подтверждение не доехало до API через прокси: {with_confirm.status}"
+    )
