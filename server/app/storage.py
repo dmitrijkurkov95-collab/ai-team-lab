@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS cards (
     status      TEXT    NOT NULL DEFAULT 'backlog',
     priority    TEXT    NOT NULL DEFAULT 'normal',
     created_at  TEXT    NOT NULL,
-    updated_at  TEXT    NOT NULL
+    updated_at  TEXT    NOT NULL,
+    deadline    TEXT             -- nullable: срок есть не у каждой задачи
 );
 
 CREATE TABLE IF NOT EXISTS comments (
@@ -45,6 +46,18 @@ SEED_CARDS = [
     ("Спринт 2: поиск и теги", "Пока только идея, обсудим после интеграции.", "backlog", "low"),
 ]
 
+
+#: Как сортировать: имя из API → SQL-выражение.
+#: Тай-брейк по id добавляется всегда (см. _order_by): при равных ключах порядок
+#: обязан быть стабильным, иначе страницы пагинации поедут — урок #11/#27.
+SORT_EXPRESSIONS = {
+    # id и created_at идут в одну сторону (AUTOINCREMENT), но created_at
+    # оставляем явным: клиенту понятнее, а совпадение — деталь реализации.
+    "created": "created_at",
+    # По смыслу, а не по алфавиту: high > normal > low.
+    "priority": "CASE priority WHEN 'high' THEN 3 WHEN 'normal' THEN 2 ELSE 1 END",
+    "deadline": "deadline",
+}
 
 #: Формат меток из контракта: 2026-08-26T12:00:00Z — ISO 8601 UTC, без дробной секунды.
 TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
@@ -105,9 +118,25 @@ class Storage:
         self.path = path
         with self._connect() as conn:
             conn.executescript(SCHEMA)
+            self._migrate(conn)
             # WAL: читатели не блокируют писателя. При нескольких соединениях
             # к одному файлу без этого легко поймать 'database is locked'.
             conn.execute("PRAGMA journal_mode = WAL")
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """Догоняет схему на уже существующих базах.
+
+        `CREATE TABLE IF NOT EXISTS` не добавляет колонки в живую таблицу:
+        у всех, кто уже гонял сервер, файл БД остался бы без `deadline`,
+        и первый же запрос упал бы с `no such column`. Проверяем и досыпаем.
+        """
+        columns = {r["name"] for r in conn.execute("PRAGMA table_info(cards)")}
+        if "deadline" not in columns:
+            conn.execute("ALTER TABLE cards ADD COLUMN deadline TEXT")
+        # Индекс создаём здесь, а не в SCHEMA: на старой базе SCHEMA выполняется
+        # раньше ALTER, и индекс по ещё не существующей колонке уронил бы старт.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_cards_deadline ON cards(deadline)")
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -165,6 +194,8 @@ class Storage:
         limit: Optional[int] = None,
         offset: Optional[int] = None,
         q: Optional[str] = None,
+        sort: Optional[str] = None,
+        order: Optional[str] = None,
     ) -> list[dict[str, Any]]:
         """Список карточек с опциональными фильтрами.
 
@@ -181,7 +212,7 @@ class Storage:
         sql = "SELECT * FROM cards"
         where, args = self._filters(status, priority, q)
         sql += where
-        sql += " ORDER BY id ASC"  # контракт: по возрастанию id
+        sql += self._order_by(sort, order)
         if limit is not None or offset:
             sql += " LIMIT ?"
             args.append(limit if limit is not None else -1)
@@ -190,6 +221,31 @@ class Storage:
             args.append(offset)
         with self._connect() as conn:
             return [dict(r) for r in conn.execute(sql, args)]
+
+    @staticmethod
+    def _order_by(sort: Optional[str], order: Optional[str]) -> str:
+        """ORDER BY с тай-брейком по id и NULL-ами дедлайна в конце.
+
+        Дефолт — `id ASC`: ровно то, что было до появления сортировки,
+        поэтому доска, не знающая про `?sort=`, работает как раньше.
+
+        Карточки без дедлайна всегда идут в конец, независимо от направления:
+        «срока нет» — это не «срок бесконечно ранний», и пустой хвост в начале
+        списка выглядел бы как баг, а не как сортировка.
+
+        Тай-брейк по id идёт в ту же сторону, что и основной ключ. Метки
+        округлены до секунды, поэтому у пачки карточек `created_at` совпадает;
+        при жёстком `id ASC` запрос «сначала новые» показывал бы внутри такой
+        пачки сначала старые — порядок был бы стабильным, но неверным на вид.
+        """
+        direction = "DESC" if (order or "").lower() == "desc" else "ASC"
+        if not sort:
+            return f" ORDER BY id {direction}"
+        expression = SORT_EXPRESSIONS[sort]
+        clause = ""
+        if sort == "deadline":
+            clause = "deadline IS NULL, "  # 0 (есть) раньше 1 (нет) — всегда
+        return f" ORDER BY {clause}{expression} {direction}, id {direction}"
 
     @staticmethod
     def _filters(
@@ -232,13 +288,20 @@ class Storage:
             row = conn.execute("SELECT * FROM cards WHERE id = ?", (card_id,)).fetchone()
         return dict(row) if row else None
 
-    def create_card(self, title: str, description: str, status: str, priority: str) -> dict[str, Any]:
+    def create_card(
+        self,
+        title: str,
+        description: str,
+        status: str,
+        priority: str,
+        deadline: Optional[str] = None,
+    ) -> dict[str, Any]:
         now = utcnow()
         with self._connect() as conn:
             cur = conn.execute(
-                "INSERT INTO cards (title, description, status, priority, created_at, updated_at)"
-                " VALUES (?,?,?,?,?,?)",
-                (title, description, status, priority, now, now),
+                "INSERT INTO cards (title, description, status, priority, created_at, updated_at,"
+                " deadline) VALUES (?,?,?,?,?,?,?)",
+                (title, description, status, priority, now, now, deadline),
             )
             new_id = cur.lastrowid
         return self.get_card(new_id)  # type: ignore[arg-type]

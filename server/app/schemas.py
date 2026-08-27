@@ -36,6 +36,37 @@ class Priority(str, Enum):
     high = "high"
 
 
+def _clean_deadline(value):
+    """Проверяет и нормализует дедлайн к формату меток контракта.
+
+    Прошлое разрешено сознательно: запрет сломал бы импорт исторических досок
+    и правку задним числом, а просроченная задача — нормальное состояние, а не
+    ошибка ввода. Просрочку считает клиент (см. контракт), сервер хранит факт.
+
+    Принимаем и `...Z`, и смещение (`+03:00`) — приводим к UTC, чтобы в базе
+    лежал один формат и сортировка по строке совпадала с хронологией.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("deadline must be an ISO 8601 datetime or null")
+        text = value.strip()
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            raise ValueError(
+                "deadline must be ISO 8601, e.g. 2026-09-01T18:00:00Z"
+            ) from None
+    if parsed.tzinfo is None:
+        # Без зоны трактуем как UTC: молча сдвинуть время на зону сервера —
+        # худший вариант, дедлайн уехал бы на часы незаметно для пользователя.
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).strftime(TS_FORMAT)
+
+
 def _clean_title(value: str) -> str:
     """Контракт: title — непустая строка до 200 символов.
 
@@ -61,11 +92,17 @@ class CardCreate(BaseModel):
     # status в контракте у POST не описан, но принять его безопасно и удобно
     # (фронт может сразу создать карточку в нужной колонке). Default — backlog.
     status: Status = Status.backlog
+    deadline: Optional[str] = None
 
     @field_validator("title")
     @classmethod
     def validate_title(cls, v: str) -> str:
         return _clean_title(v)
+
+    @field_validator("deadline", mode="before")
+    @classmethod
+    def validate_deadline(cls, v):
+        return _clean_deadline(v)
 
     @field_validator("description", mode="before")
     @classmethod
@@ -82,11 +119,17 @@ class CardUpdate(BaseModel):
     description: Optional[str] = None
     priority: Optional[Priority] = None
     status: Optional[Status] = None
+    deadline: Optional[str] = None
 
     @field_validator("title")
     @classmethod
     def validate_title(cls, v):
         return v if v is None else _clean_title(v)
+
+    @field_validator("deadline", mode="before")
+    @classmethod
+    def validate_deadline(cls, v):
+        return _clean_deadline(v)
 
 
 class Card(BaseModel):
@@ -97,6 +140,11 @@ class Card(BaseModel):
     priority: Priority
     created_at: datetime
     updated_at: datetime
+    deadline: Optional[datetime] = None
+
+    @field_serializer("deadline")
+    def serialize_deadline(self, value: Optional[datetime], _info) -> Optional[str]:
+        return None if value is None else _serialize_ts(value)
 
     @field_serializer("created_at", "updated_at")
     def serialize_ts(self, value: datetime, _info) -> str:

@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import os
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status as http_status
 from fastapi.exceptions import RequestValidationError
@@ -121,6 +121,11 @@ def health(store: Storage = Depends(get_storage)) -> dict:
 #: Потолок для явного ?limit= — защита от ?limit=100000.
 MAX_LIMIT = 200
 
+#: Допустимые значения ?sort= и ?order=. Enum, а не свободная строка:
+#: имя поля из запроса не должно доезжать до SQL даже теоретически.
+SortField = Literal["created", "priority", "deadline"]
+SortOrder = Literal["asc", "desc"]
+
 
 @app.get(f"{API_PREFIX}/cards", response_model=list[Card], tags=["cards"])
 def list_cards(
@@ -143,6 +148,13 @@ def list_cards(
         min_length=1,
         max_length=200,
         description="поиск подстроки в title и description, без учёта регистра",
+    ),
+    sort: Optional[SortField] = Query(
+        default=None,
+        description="поле сортировки; без параметра — по возрастанию id (как раньше)",
+    ),
+    order: Optional[SortOrder] = Query(
+        default=None, description="направление сортировки, по умолчанию asc"
     ),
     store: Storage = Depends(get_storage),
 ) -> list[dict]:
@@ -185,6 +197,8 @@ def list_cards(
         limit=limit,
         offset=offset,
         q=q_value,
+        sort=sort,
+        order=order,
     )
 
 
@@ -200,6 +214,7 @@ def create_card(payload: CardCreate, store: Storage = Depends(get_storage)) -> d
         description=payload.description,
         status=payload.status.value,
         priority=payload.priority.value,
+        deadline=payload.deadline,
     )
 
 
@@ -211,7 +226,10 @@ def get_card(card_id: int, store: Storage = Depends(get_storage)) -> dict:
 @app.patch(f"{API_PREFIX}/cards/{{card_id}}", response_model=Card, tags=["cards"])
 def update_card(card_id: int, payload: CardUpdate, store: Storage = Depends(get_storage)) -> dict:
     _card_or_404(store, card_id)
-    fields = payload.model_dump(exclude_unset=True, exclude_none=True)
+    # exclude_none нельзя применять огулом: `{"deadline": null}` — это осмысленный
+    # запрос «снять срок», и он обязан отличаться от «поле не передано».
+    fields = payload.model_dump(exclude_unset=True)
+    fields = {k: v for k, v in fields.items() if v is not None or k == "deadline"}
     for key in ("status", "priority"):
         if key in fields:
             fields[key] = fields[key].value if hasattr(fields[key], "value") else fields[key]
