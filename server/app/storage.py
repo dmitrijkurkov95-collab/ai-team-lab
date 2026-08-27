@@ -47,6 +47,10 @@ SEED_CARDS = [
 ]
 
 
+#: Сколько ждать освобождения блокировки записи, секунд. Подобрано под
+#: загруженный раннер CI: при 5 с очередь писателей упиралась в таймаут (#47).
+BUSY_TIMEOUT = 15.0
+
 #: Как сортировать: имя из API → SQL-выражение.
 #: Тай-брейк по id добавляется всегда (см. _order_by): при равных ключах порядок
 #: обязан быть стабильным, иначе страницы пагинации поедут — урок #11/#27.
@@ -61,6 +65,14 @@ SORT_EXPRESSIONS = {
 
 #: Формат меток из контракта: 2026-08-26T12:00:00Z — ISO 8601 UTC, без дробной секунды.
 TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+class StorageBusy(Exception):
+    """База занята другим писателем дольше, чем мы готовы ждать.
+
+    Отдельный тип нужен, чтобы HTTP-слой отличал «попробуй ещё раз» от
+    настоящей поломки: клиенту это 503 с Retry-After, а не 500.
+    """
 
 
 def _ulower(value: Optional[str]) -> Optional[str]:
@@ -143,12 +155,26 @@ class Storage:
         """Соединение на операцию: открыли, поработали, закрыли.
 
         `timeout` — сколько ждать снятия блокировки записи, прежде чем
-        отдать 'database is locked'. Пять секунд с запасом покрывают
-        параллельные записи на файловой БД.
+        отдать 'database is locked'. На загруженном раннере CI пяти секунд
+        не хватало: писатели выстраивались в очередь, ожидание упиралось
+        в таймаут, и клиент получал 500 (issue #47).
+
+        Что изменено:
+        * ожидание поднято до BUSY_TIMEOUT и продублировано `PRAGMA busy_timeout`
+          — параметр `timeout` покрывает не все внутренние пути SQLite;
+        * `PRAGMA synchronous = NORMAL` — в WAL это безопасно (запись переживает
+          падение процесса) и заметно укорачивает удержание блокировки, то есть
+          лечит причину очереди, а не только её симптом;
+        * исчерпанное ожидание превращается в StorageBusy → 503, а не 500.
         """
-        conn = sqlite3.connect(self.path, timeout=5.0)
+        conn = sqlite3.connect(self.path, timeout=BUSY_TIMEOUT)
         conn.row_factory = sqlite3.Row
         try:
+            conn.execute(f"PRAGMA busy_timeout = {int(BUSY_TIMEOUT * 1000)}")
+            # В режиме WAL достаточно NORMAL: транзакция переживает падение
+            # процесса, теряется только последний коммит при отказе ОС.
+            # FULL заставлял ждать fsync внутри блокировки на каждой записи.
+            conn.execute("PRAGMA synchronous = NORMAL")
             conn.execute("PRAGMA foreign_keys = ON")  # каскад удаления комментариев
             # Встроенный LIKE в SQLite регистронезависим ТОЛЬКО для ASCII:
             # 'Карточка' LIKE '%карточка%' → 0 совпадений, а доска у нас русская.
@@ -156,6 +182,13 @@ class Storage:
             conn.create_function("ulower", 1, _ulower, deterministic=True)
             yield conn
             conn.commit()
+        except sqlite3.OperationalError as exc:
+            conn.rollback()
+            # 'database is locked' / 'database is busy' — не поломка сервера,
+            # а исчерпанное ожидание. Клиенту честнее 503 с Retry-After.
+            if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+                raise StorageBusy(str(exc)) from exc
+            raise
         except Exception:
             conn.rollback()
             raise

@@ -25,7 +25,7 @@ from .schemas import (
     Priority,
     Status,
 )
-from .storage import DEFAULT_DB, Storage
+from .storage import DEFAULT_DB, Storage, StorageBusy
 
 API_PREFIX = "/api/v1"
 
@@ -76,6 +76,24 @@ def _humanize(error: dict) -> str:
     # Pydantic префиксует пользовательские ValueError строкой "Value error, "
     msg = msg.removeprefix("Value error, ")
     return f"{field}: {msg}" if field else msg
+
+
+@app.exception_handler(StorageBusy)
+async def storage_busy_handler(request: Request, exc: StorageBusy) -> JSONResponse:
+    """База занята другим писателем — это 503, а не 500.
+
+    Разница принципиальная: 500 говорит «сервер сломан, не повторяй», 503 —
+    «занято, повтори». Под параллельной нагрузкой клиент получал 500 на
+    обычную очередь писателей и считал это отказом (issue #47).
+
+    Retry-After даёт клиенту конкретную паузу вместо угадывания, а очередь
+    правок фронта (#28) умеет такие ответы переигрывать.
+    """
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "База временно занята другой записью, повторите запрос"},
+        headers={"Retry-After": "1"},
+    )
 
 
 @app.exception_handler(RequestValidationError)
