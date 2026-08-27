@@ -504,3 +504,93 @@ def test_comments_order_stable_within_same_second(client):
         client.post(f"{API}/cards/{card['id']}/comments", json={"text": t})
     listed = [c["text"] for c in client.get(f"{API}/cards/{card['id']}/comments").json()]
     assert listed == texts
+
+
+# ---------------------------------------------------------------- поиск (#30)
+
+
+def test_search_finds_by_title_substring(client):
+    make_card(client, title="Сверстать колонки")
+    make_card(client, title="Починить CI")
+    got = client.get(f"{API}/cards", params={"q": "колонк"}).json()
+    assert [c["title"] for c in got] == ["Сверстать колонки"]
+
+
+def test_search_finds_by_description(client):
+    make_card(client, title="Задача", description="нужен рефакторинг хранилища")
+    make_card(client, title="Другая", description="ничего интересного")
+    got = client.get(f"{API}/cards", params={"q": "рефакторинг"}).json()
+    assert len(got) == 1 and got[0]["title"] == "Задача"
+
+
+def test_search_is_case_insensitive_cyrillic(client):
+    """Встроенный LIKE в SQLite регистронезависим только для ASCII — доска русская."""
+    make_card(client, title="Дизайн Колонок")
+    for term in ("дизайн", "ДИЗАЙН", "ДиЗаЙн"):
+        got = client.get(f"{API}/cards", params={"q": term}).json()
+        assert len(got) == 1, f"не нашлось по запросу {term!r}"
+
+
+def test_search_is_case_insensitive_latin(client):
+    make_card(client, title="Fix CI Pipeline")
+    assert len(client.get(f"{API}/cards", params={"q": "ci pipeline"}).json()) == 1
+
+
+def test_search_trims_whitespace(client):
+    make_card(client, title="Поиск")
+    assert len(client.get(f"{API}/cards", params={"q": "  поиск  "}).json()) == 1
+
+
+@pytest.mark.parametrize("blank", ["", " ", "   ", "\t"])
+def test_blank_search_is_422(client, blank):
+    """Пустой q — 422, а не «фильтр, который молча не фильтрует»."""
+    r = client.get(f"{API}/cards", params={"q": blank})
+    assert r.status_code == 422
+    assert isinstance(r.json()["detail"], str)
+
+
+def test_search_wildcards_are_literal(client):
+    """'%' в запросе — обычный символ, а не маска «что угодно»."""
+    make_card(client, title="Скидка 100% на всё")
+    make_card(client, title="Обычная карточка")
+    got = client.get(f"{API}/cards", params={"q": "100%"}).json()
+    assert len(got) == 1 and "100%" in got[0]["title"]
+
+
+def test_search_underscore_is_literal(client):
+    make_card(client, title="файл_отчёт")
+    make_card(client, title="файлХотчёт")
+    got = client.get(f"{API}/cards", params={"q": "файл_"}).json()
+    assert len(got) == 1 and got[0]["title"] == "файл_отчёт"
+
+
+def test_search_no_matches_is_200_and_empty(client):
+    make_card(client, title="что-то")
+    r = client.get(f"{API}/cards", params={"q": "несуществующее"})
+    assert r.status_code == 200 and r.json() == []
+
+
+def test_search_combines_with_filters(client):
+    make_card(client, title="Дизайн доски", status="done", priority="high")
+    make_card(client, title="Дизайн иконок", status="backlog", priority="high")
+    got = client.get(f"{API}/cards", params={"q": "дизайн", "status": "done"}).json()
+    assert len(got) == 1 and got[0]["status"] == "done"
+
+
+def test_search_combines_with_limit(client):
+    for i in range(5):
+        make_card(client, title=f"Поиск {i}")
+    assert len(client.get(f"{API}/cards", params={"q": "поиск", "limit": 2}).json()) == 2
+
+
+def test_total_count_respects_search(client):
+    """X-Total-Count считается по тому же условию, что и выдача, — иначе доска решит, что она неполная."""
+    for i in range(4):
+        make_card(client, title=f"Поиск {i}")
+    make_card(client, title="Мимо")
+    r = client.get(f"{API}/cards", params={"q": "поиск", "limit": 2})
+    assert r.headers["X-Total-Count"] == "4" and len(r.json()) == 2
+
+
+def test_search_too_long_is_422(client):
+    assert client.get(f"{API}/cards", params={"q": "я" * 201}).status_code == 422
