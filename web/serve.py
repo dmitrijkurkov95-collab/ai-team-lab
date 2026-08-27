@@ -17,6 +17,7 @@ import urllib.error
 import urllib.request
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import quote
 
 WEB_DIR = Path(__file__).resolve().parent
 API_TARGET = os.environ.get("KANBAN_API", "http://localhost:8000").rstrip("/")
@@ -25,6 +26,31 @@ HOP_BY_HOP = {
     "te", "trailers", "transfer-encoding", "upgrade", "content-encoding",
     "content-length",
 }
+
+
+def _encode_path(path: str) -> str:
+    """Привести путь с query к ASCII перед отправкой на бэкенд.
+
+    `http.client` кодирует строку запроса в ASCII и падает с
+    `UnicodeEncodeError`, если клиент прислал сырые не-ASCII символы —
+    например `?q=задача` или `?status=мусор`, набранные руками в curl.
+    Браузер такое кодирует сам, а вот curl и тесты — нет, и прокси ронять
+    из-за этого весь запрос не должен: пусть кириллица доедет до API,
+    а он уже ответит по контракту (200 или 422).
+
+    Уже закодированные последовательности (`%d0%bc`) не трогаем — `safe`
+    включает `%`, поэтому повторного экранирования не происходит.
+    """
+    # BaseHTTPRequestHandler отдаёт `path` строкой, декодированной как latin-1
+    # (по букве HTTP заголовок запроса — байты). Возвращаем исходные байты и
+    # трактуем их как UTF-8, иначе `?q=задача` уедет на бэкенд мусором вида
+    # `Ð·Ð°Ð´Ð°Ñ‡Ð°`: прокси не рухнет, но данные исказит, что ещё хуже.
+    raw = path.encode("latin-1", errors="ignore").decode("utf-8", errors="replace")
+    split = raw.split("?", 1)
+    safe_path = quote(split[0], safe="/%")
+    if len(split) == 1:
+        return safe_path
+    return f"{safe_path}?{quote(split[1], safe='/%&=+,:;@$!*()[]~-_.\"' + chr(39))}"
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -41,7 +67,7 @@ class Handler(SimpleHTTPRequestHandler):
     def _proxy(self) -> None:
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length) if length else None
-        url = f"{API_TARGET}{self.path}"
+        url = f"{API_TARGET}{_encode_path(self.path)}"
 
         req = urllib.request.Request(url, data=body, method=self.command)
         ctype = self.headers.get("Content-Type")
@@ -95,7 +121,11 @@ class Handler(SimpleHTTPRequestHandler):
 
     def end_headers(self):
         # Дев-сервер: не даём браузеру кэшировать правки.
-        if not self.path.startswith("/api/"):
+        # `path` появляется только после разбора строки запроса. Если она
+        # кривая (400 Bad request syntax), обработчик уже шлёт ответ, а
+        # атрибута ещё нет — без getattr прокси падал с AttributeError
+        # вместо честного 400.
+        if not getattr(self, "path", "").startswith("/api/"):
             self.send_header("Cache-Control", "no-store")
         super().end_headers()
 

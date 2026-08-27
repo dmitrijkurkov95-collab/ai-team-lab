@@ -214,7 +214,13 @@ def test_при_обрыве_сети_правка_копится_а_не_тер
     page.wait_for_function("() => window.__kanban.queue.size === 1", timeout=10000)
 
     assert column_of(page, card_id) == target, "карточка должна остаться в новой колонке"
-    assert page.get_attribute("#sync-indicator", "data-state") == "pending"
+    # Между попытками индикатор кратко показывает `syncing` — очередь как раз
+    # повторяет операцию. Ждём паузы между повторами, иначе проверка ловит
+    # случайную фазу цикла и мигает красным на ровном месте.
+    page.wait_for_function(
+        "() => document.getElementById('sync-indicator').dataset.state === 'pending'",
+        timeout=10000,
+    )
     assert _queue_size(page) == 1
     assert page.locator("#btn-retry").is_visible()
 
@@ -574,3 +580,180 @@ def test_конфликт_409_обрабатывается_политикой_а
     assert "Конфликт" in toasts or "успели изменить" in toasts, (
         f"пользователь должен понять, что случилось: {toasts}"
     )
+
+
+# ----------------------------------------------------- живой рефреш (#32)
+
+
+def test_доска_сама_подхватывает_чужие_карточки(page):
+    """Второй пользователь создал карточку — она появляется без перезагрузки."""
+    created = page.request.post(
+        f"{WEB_URL}/api/v1/cards",
+        data={"title": "poll-appears", "status": "review"},
+        headers={"Content-Type": "application/json"},
+    )
+    assert created.status == 201
+    card_id = created.json()["id"]
+
+    # интервал опроса 10 с — ждём с запасом на медленный раннер
+    page.wait_for_selector(f'article.card[data-id="{card_id}"]', timeout=20000)
+    assert page.locator(f'article.card[data-id="{card_id}"]').count() == 1
+
+
+def test_опрос_не_затирает_несинхронизированную_правку(page):
+    """Главный инвариант: очередь важнее ответа сервера.
+
+    Пользователь перетащил карточку, правка ещё не ушла. Фоновый опрос видит
+    на сервере старый статус — и не имеет права вернуть карточку назад:
+    это соврало бы о состоянии и спровоцировало повторное действие.
+    """
+    card_id = make_card(page, "poll-vs-queue")
+    origin = column_of(page, card_id)
+    target = next(s for s in ("done", "review", "in_progress") if s != origin)
+
+    # PATCH и GET карточки рвём, список (опрос) продолжает ходить
+    page.route(
+        "**/api/v1/cards/**",
+        lambda route: route.abort()
+        if route.request.method in ("PATCH", "GET")
+        else route.continue_(),
+    )
+    page.evaluate(DRAG_SNIPPET, [card_id, target])
+    page.wait_for_timeout(1500)
+    assert page.evaluate("window.__kanban.queue.size") >= 1
+
+    # переживаем минимум один тик опроса
+    page.wait_for_timeout(13000)
+
+    assert column_of(page, card_id) == target, "опрос затёр неотправленную правку"
+    assert page.evaluate("window.__kanban.queue.size") >= 1
+
+    page.unroute("**/api/v1/cards/**")
+    page.evaluate("window.__kanban.queue.flushNow()")
+    page.wait_for_timeout(2500)
+    assert page.evaluate("window.__kanban.queue.size") == 0
+    server_status = page.request.get(f"{WEB_URL}/api/v1/cards/{card_id}").json()["status"]
+    assert server_status == target, "после синхронизации состояния должны сойтись"
+
+
+def test_сбой_опроса_не_обнуляет_доску(page):
+    """Таймаут фонового запроса не должен мигать пустой доской.
+
+    `loadBoard` при ошибке очищает список — это верно для первой загрузки,
+    но недопустимо для тихого опроса: данные уже показаны.
+    """
+    before = page.locator("article.card").count()
+    assert before > 0
+
+    page.route("**/api/v1/**", lambda route: route.abort())
+    page.wait_for_timeout(13000)
+
+    assert page.locator("article.card").count() == before, "доска не должна опустеть"
+    assert page.get_attribute("#freshness", "data-state") == "stale"
+    assert "нет связи" in page.inner_text("#freshness")
+    assert page.evaluate("window.__kanban.poller.failures") >= 1
+
+
+def test_после_восстановления_связи_индикатор_снова_свежий(page):
+    """Backoff сбрасывается, подпись возвращается к спокойной."""
+    page.route("**/api/v1/**", lambda route: route.abort())
+    page.wait_for_timeout(12000)
+    assert page.evaluate("window.__kanban.poller.failures") >= 1
+
+    page.unroute("**/api/v1/**")
+    page.evaluate("window.__kanban.poller.pollNow()")
+    page.wait_for_timeout(2000)
+
+    assert page.evaluate("window.__kanban.poller.failures") == 0, "backoff должен сброситься"
+    assert "обновлено" in page.inner_text("#freshness")
+    assert page.get_attribute("#freshness", "data-state") == "live"
+
+
+def test_backoff_растёт_при_повторных_сбоях(page):
+    """Пауза увеличивается: 10с → 20с → 40с → 60с (потолок).
+
+    Первая ошибка оставляет базовые 10 с — рост начинается со второй,
+    чтобы одиночный таймаут не отправлял доску в долгий сон.
+    """
+    delays = page.evaluate(
+        """() => {
+          const p = window.__kanban.poller;
+          const saved = p.failures;
+          const out = [0,1,2,3,4,5].map(f => { p.failures = f; return p.currentDelay(); });
+          p.failures = saved;
+          return out;
+        }"""
+    )
+    assert delays[0] == 10000, f"без ошибок — базовый интервал: {delays}"
+    assert delays[1] == 10000, f"первая ошибка не должна удлинять паузу: {delays}"
+    assert delays[2] == 20000 and delays[3] == 40000, f"рост нарушен: {delays}"
+    assert delays[4] == 60000 and delays[5] == 60000, f"потолок 60 с не держится: {delays}"
+
+
+def test_скрытая_вкладка_не_опрашивает_сервер(page):
+    """Никто не смотрит — не тратим сеть и батарею."""
+    page.wait_for_timeout(500)
+    scheduled = page.evaluate(
+        """() => {
+          const p = window.__kanban.poller;
+          const orig = Object.getOwnPropertyDescriptor(Document.prototype, 'hidden');
+          Object.defineProperty(document, 'hidden', {configurable: true, get: () => true});
+          p.clearTimer();
+          p.schedule();
+          const armed = p.timer !== null;
+          Object.defineProperty(document, 'hidden', orig || {configurable: true, get: () => false});
+          p.schedule();
+          return armed;
+        }"""
+    )
+    assert scheduled is False, "в скрытой вкладке таймер опроса не должен взводиться"
+
+
+# ------------------------------------------------- прокси дев-сервера
+
+
+def test_прокси_не_падает_на_сырой_кириллице_в_query(page):
+    """Сырые не-ASCII байты в query роняли прокси, а не запрос.
+
+    `http.client` кодирует строку запроса в ASCII: `?q=задача` без
+    процентного экранирования (curl, скрипты, ручная отладка) приводил к
+    `UnicodeEncodeError` и обрыву соединения. Браузер такое кодирует сам,
+    поэтому дыра не всплывала в UI-тестах — нашлась при ревью чужого PR.
+    """
+    r = page.request.get(f"{WEB_URL}/api/v1/cards?status=мусор")
+    assert r.status == 422, f"ожидали честный 422, получили {r.status}"
+    assert isinstance(r.json()["detail"], str)
+
+
+def test_прокси_сохраняет_кириллицу_без_искажения(page):
+    """Мало не упасть — нельзя и портить данные по дороге."""
+    title = "Уникальное слово черёмуха"
+    created = page.request.post(
+        f"{WEB_URL}/api/v1/cards",
+        data={"title": title},
+        headers={"Content-Type": "application/json"},
+    )
+    assert created.status == 201
+
+    found = page.request.get(f"{WEB_URL}/api/v1/cards?q=черёмуха").json()
+    assert any(c["title"] == title for c in found), (
+        f"поиск по кириллице через прокси должен находить карточку: {found}"
+    )
+    page.request.delete(f"{WEB_URL}/api/v1/cards/{created.json()['id']}")
+
+
+def test_прокси_отвечает_на_битый_запрос_а_не_падает(page):
+    """400 Bad request не должен превращаться в AttributeError.
+
+    `end_headers` обращался к `self.path`, которого при неразобранной
+    строке запроса ещё нет — обработчик падал вместо честного ответа.
+    """
+    import socket
+
+    with socket.create_connection(("localhost", 5173), timeout=5) as sock:
+        sock.sendall(b"GET /api/v1/cards?q=\xd0\xb7\xd0\xb0 \xff HTTP/1.1\r\nHost: x\r\n\r\n")
+        reply = sock.recv(256)
+    assert reply.startswith(b"HTTP/1."), f"сервер должен ответить, а не оборвать: {reply!r}"
+
+    # и остаться живым для следующих запросов
+    assert page.request.get(f"{WEB_URL}/api/v1/cards").status == 200
