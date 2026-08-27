@@ -33,6 +33,35 @@ jobs:
           curl -sf http://127.0.0.1:8000/api/v1/cards >/dev/null || { echo 'сервер не поднялся'; tail -40 /tmp/server.log; exit 1; }
           python -m pytest tests -q
 
+  qa-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r server/requirements.txt -r tests/requirements.txt pytest
+      # Серверы поднимает сама фикстура tests_e2e (порты свободные программно,
+      # при падении печатает логи обоих процессов) — стартовать ничего не нужно.
+      - run: python -m pytest tests_e2e -q
+
+  qa-load:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r server/requirements.txt -r tests/requirements.txt pytest
+      - run: |
+          (cd server && nohup python run.py >/tmp/server.log 2>&1 &)
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8000/api/v1/cards >/dev/null && break
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:8000/api/v1/cards >/dev/null || { echo 'сервер не поднялся'; tail -40 /tmp/server.log; exit 1; }
+          python -m pytest tests/test_concurrency.py -q
+
   web-syntax:
     runs-on: ubuntu-latest
     steps:
