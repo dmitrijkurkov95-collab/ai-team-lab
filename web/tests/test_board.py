@@ -401,3 +401,176 @@ def test_пустой_заголовок_total_count_не_считается_н�
         f"пустой заголовок не должен поднимать тревогу: {toasts}"
     )
     assert page.locator("article.card").count() == len(full)
+
+
+def make_card(page, title="conflict-test", status="backlog"):
+    """Своя карточка для теста конфликтов.
+
+    Эти тесты удаляют карточки, поэтому брать первую попавшуюся с доски нельзя:
+    прогон подряд исчерпает seed и следующие тесты останутся без данных.
+    """
+    created = page.request.post(
+        f"{WEB_URL}/api/v1/cards",
+        data={"title": title, "status": status},
+        headers={"Content-Type": "application/json"},
+    )
+    assert created.status == 201, created.text()
+    card_id = str(created.json()["id"])
+    page.reload(wait_until="networkidle")
+    page.wait_for_timeout(700)
+    page.wait_for_selector(f'article.card[data-id="{card_id}"]')
+    return card_id
+
+
+# --------------------------------------------------------------- конфликты (#28)
+
+
+def test_удалённая_карточка_инвалидирует_правку_а_не_висит_в_очереди(page):
+    """Карточку удалили с другого клиента, пока правка ждала сети.
+
+    Повторять перенос бессмысленно — объекта больше нет. Операция обязана
+    уйти из очереди, карточка — с доски, а пользователь должен узнать причину,
+    а не смотреть на вечный счётчик «1 правка ждёт сети».
+    """
+    card_id = make_card(page, "gone-invalidate")
+    origin = column_of(page, card_id)
+    target = next(s for s in ("done", "review", "in_progress", "backlog") if s != origin)
+
+    # рвём сеть, чтобы правка осталась в очереди
+    page.route(
+        "**/api/v1/cards/**",
+        lambda route: route.abort()
+        if route.request.method in ("PATCH", "GET")
+        else route.continue_(),
+    )
+    page.evaluate(DRAG_SNIPPET, [card_id, target])
+    page.wait_for_timeout(1200)
+    assert page.evaluate("window.__kanban.queue.size") >= 1
+
+    # «другой пользователь» удаляет карточку
+    deleted = page.request.delete(f"{WEB_URL}/api/v1/cards/{card_id}")
+    assert deleted.status == 204
+
+    # сеть вернулась — повтор упрётся в 404
+    page.unroute("**/api/v1/cards/**")
+    page.evaluate("window.__kanban.queue.flushNow()")
+    page.wait_for_timeout(2500)
+
+    assert page.evaluate("window.__kanban.queue.size") == 0, "правка не должна висеть вечно"
+    assert page.locator(f'article.card[data-id="{card_id}"]').count() == 0, "карточки больше нет"
+
+    toasts = " ".join(page.locator("#toasts .toast").all_inner_texts())
+    assert "удалена другим" in toasts, f"нужно объяснение, а не голый код: {toasts}"
+
+
+def test_все_правки_удалённой_карточки_снимаются_разом(page):
+    """404 по одной операции инвалидирует и остальные к той же карточке.
+
+    Иначе пользователь получит серию одинаковых сообщений об одном событии.
+    """
+    card_id = make_card(page, "gone-multi")
+
+    page.route(
+        "**/api/v1/cards/**",
+        lambda route: route.abort()
+        if route.request.method in ("PATCH", "GET")
+        else route.continue_(),
+    )
+    # две разные операции по одной карточке (move схлопывается, поэтому кладём вручную)
+    page.evaluate(
+        """(cid) => {
+          const q = window.__kanban.queue;
+          q.enqueue('move', Number(cid), {status: 'done'}, {status: 'backlog', updated_at: 'x'});
+          q.pending.push({id: 999, kind: 'move', cardId: Number(cid),
+                          payload: {status: 'review'}, attempts: 0, baseline: null});
+        }""",
+        card_id,
+    )
+    page.wait_for_timeout(400)
+    assert page.evaluate("window.__kanban.queue.size") == 2
+
+    assert page.request.delete(f"{WEB_URL}/api/v1/cards/{card_id}").status == 204
+
+    page.unroute("**/api/v1/cards/**")
+    page.evaluate("window.__kanban.queue.flushNow()")
+    page.wait_for_timeout(2500)
+
+    assert page.evaluate("window.__kanban.queue.size") == 0, "обе операции должны уйти"
+    toasts = page.locator("#toasts .toast").all_inner_texts()
+    gone = [t for t in toasts if "удалена другим" in t]
+    assert len(gone) == 1, f"одно событие — одно сообщение, а не {len(gone)}: {toasts}"
+    assert "Отменено правок: 2" in gone[0], f"нужно указать масштаб: {gone[0]}"
+
+
+def test_перезапись_чужой_правки_не_проходит_молча(page):
+    """Last-write-wins: наш перенос применился, но затёр чужое изменение.
+
+    Версионирования в контракте нет, отвергнуть устаревшую запись сервер не
+    может — поэтому единственная честная реакция — предупредить пользователя.
+    """
+    import time
+
+    card_id = make_card(page, "overwrite-check")
+    origin = column_of(page, card_id)
+    target = next(s for s in ("done", "review", "in_progress") if s != origin)
+
+    page.route(
+        "**/api/v1/cards/**",
+        lambda route: route.abort() if route.request.method == "PATCH" else route.continue_(),
+    )
+    page.evaluate(DRAG_SNIPPET, [card_id, target])
+    page.wait_for_timeout(1200)
+
+    # метки времени в контракте посекундные — иначе чужая правка не отличима
+    time.sleep(1.2)
+    other = page.request.patch(
+        f"{WEB_URL}/api/v1/cards/{card_id}",
+        data={"description": "правка другого пользователя"},
+        headers={"Content-Type": "application/json"},
+    )
+    assert other.status == 200
+
+    page.unroute("**/api/v1/cards/**")
+    page.evaluate("window.__kanban.queue.flushNow()")
+    page.wait_for_timeout(2500)
+
+    assert column_of(page, card_id) == target, "наша правка должна победить (LWW)"
+    toasts = " ".join(page.locator("#toasts .toast").all_inner_texts())
+    assert "перекрыла" in toasts or "параллельно" in toasts, (
+        f"о перезаписи чужой правки надо сказать: {toasts}"
+    )
+
+
+def test_конфликт_409_обрабатывается_политикой_а_не_падением(page):
+    """409 сервер сегодня не отдаёт — проверяем через мок.
+
+    Версионирования в контракте нет, поэтому живой сервер этот путь не
+    вызывает. Ветка существует, чтобы появление `If-Match` не потребовало
+    переписывать очередь; тест фиксирует её поведение.
+    """
+    import json as _json
+
+    card_id = make_card(page, "conflict-409")
+    origin = column_of(page, card_id)
+    target = next(s for s in ("done", "review", "in_progress") if s != origin)
+
+    def conflict(route):
+        if route.request.method == "PATCH":
+            route.fulfill(
+                status=409,
+                content_type="application/json",
+                headers={"Access-Control-Allow-Origin": "*"},
+                body=_json.dumps({"detail": "Карточка изменена другим пользователем"}),
+            )
+        else:
+            route.continue_()
+
+    page.route("**/api/v1/cards/**", conflict)
+    page.evaluate(DRAG_SNIPPET, [card_id, target])
+    page.wait_for_timeout(2500)
+
+    assert page.evaluate("window.__kanban.queue.size") == 0, "конфликт не повторяют бесконечно"
+    toasts = " ".join(page.locator("#toasts .toast").all_inner_texts())
+    assert "Конфликт" in toasts or "успели изменить" in toasts, (
+        f"пользователь должен понять, что случилось: {toasts}"
+    )
