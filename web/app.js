@@ -3,7 +3,7 @@
  * здесь только состояние, рендер и события.
  */
 import api, { ApiError, BASE_URL } from './api.js';
-import { SyncQueue } from './sync.js';
+import { SyncQueue, OpOutcome } from './sync.js';
 
 const COLUMNS = [
   { status: 'backlog', label: 'Бэклог' },
@@ -77,19 +77,81 @@ function setStatusLine(text) {
 
 // ---------------------------------------------------------------- синхронизация
 
-/** Выполняет отложенную операцию. Пока копим только перемещения — см. sync.js. */
+/**
+ * Выполняет отложенную операцию. Пока копим только перемещения — см. sync.js.
+ *
+ * Перед записью читаем карточку: это даёт и честный `404`, если её удалили с
+ * другого клиента, и метку `updated_at`, по которой видно, влезла ли между
+ * нашей постановкой в очередь и отправкой чужая правка.
+ */
 async function performOp(op) {
-  if (op.kind === 'move') {
-    const updated = await api.moveCard(op.cardId, op.payload.status);
-    const card = state.cards.find((c) => c.id === op.cardId);
-    if (card) Object.assign(card, updated);
-    render();
-    return updated;
+  if (op.kind !== 'move') throw new Error(`неизвестный тип операции: ${op.kind}`);
+
+  if (op.baseline) {
+    // GET бросит ApiError 404, если карточки больше нет — очередь это поймает
+    // и инвалидирует правку вместо вечных повторов.
+    const current = await api.getCard(op.cardId);
+    op.baseline.serverUpdatedAt = current.updated_at;
+    op.baseline.serverStatus = current.status;
   }
-  throw new Error(`неизвестный тип операции: ${op.kind}`);
+
+  const updated = await api.moveCard(op.cardId, op.payload.status);
+  const card = state.cards.find((c) => c.id === op.cardId);
+  if (card) Object.assign(card, updated);
+  render();
+  return updated;
 }
 
-const queue = new SyncQueue(performOp, renderSyncIndicator);
+/**
+ * Реакция на исход операции: пользователь никогда не должен гадать,
+ * применилась ли его правка.
+ */
+function handleOutcome(op, outcome, info) {
+  if (outcome === OpOutcome.DONE) return;
+
+  if (outcome === OpOutcome.GONE) {
+    // Карточку удалили с другого клиента — правка потеряла объект.
+    const extra = (info.alsoDropped || []).length;
+    state.cards = state.cards.filter((c) => c.id !== op.cardId);
+    state.commentCounts.delete(op.cardId);
+    render();
+    toast(
+      `Карточка #${op.cardId} удалена другим пользователем — ваш перенос отменён.` +
+        (extra ? ` Отменено правок: ${extra + 1}.` : ''),
+      'error',
+      'Правка потеряла смысл',
+    );
+    return;
+  }
+
+  if (outcome === OpOutcome.CONFLICT) {
+    // Сервер отверг запись из-за расхождения состояния. Сегодня недостижимо
+    // (в контракте нет версионирования), но политика определена заранее.
+    toast(
+      `Карточку #${op.cardId} успели изменить раньше. Ваш перенос не применён — ` +
+        'доска обновлена актуальными данными.',
+      'error',
+      'Конфликт изменений',
+    );
+    loadBoard();
+    return;
+  }
+
+  if (outcome === OpOutcome.OVERWRITTEN) {
+    // Применилось, но поверх чужой правки. Молчать нельзя.
+    toast(
+      `Карточку #${op.cardId} параллельно менял кто-то ещё. Применён ваш вариант — ` +
+        'если это ошибка, верните карточку вручную.',
+      'info',
+      'Ваша правка перекрыла чужую',
+    );
+    return;
+  }
+
+  // REJECTED — обычный отказ 4xx, обрабатывается колбэком операции (откат).
+}
+
+const queue = new SyncQueue(performOp, renderSyncIndicator, handleOutcome);
 
 /**
  * Индикатор синхронизации: заметный, но не навязчивый — строка в шапке,
@@ -304,14 +366,25 @@ function moveCard(id, status) {
   card.status = status;
   render();
 
-  const op = queue.enqueue('move', id, { status });
-  op.onPermanentFailure = (error) => {
+  // baseline — состояние, которое пользователь видел, когда начал двигать
+  // карточку. По нему потом определяется, влезла ли между делом чужая правка.
+  const op = queue.enqueue('move', id, { status }, {
+    status: previous,
+    updated_at: card.updated_at,
+  });
+
+  op.onPermanentFailure = (error, outcome) => {
     const current = state.cards.find((c) => c.id === id);
     if (current) {
       current.status = previous; // доска не должна врать о состоянии сервера
       render();
     }
-    reportError(error, `Не удалось перенести карточку #${id}`);
+    // Про исчезнувшую карточку и конфликт пользователю рассказывает
+    // handleOutcome — со сценарием, а не голым кодом ошибки. Здесь только
+    // рядовые отказы, чтобы не показывать два сообщения об одном событии.
+    if (outcome === OpOutcome.REJECTED || outcome === undefined) {
+      reportError(error, `Не удалось перенести карточку #${id}`);
+    }
   };
 }
 
