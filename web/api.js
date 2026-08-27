@@ -34,12 +34,31 @@ export const BASE_URL = resolveBase();
 
 /** Ошибка API с кодом статуса — интерфейсу есть что показать пользователю. */
 export class ApiError extends Error {
-  constructor(message, status, details) {
+  constructor(message, status, details, retryAfterMs = null) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
     this.details = details;
+    /** Пауза из заголовка Retry-After, мс. Сервер знает лучше нас — см. 503. */
+    this.retryAfterMs = retryAfterMs;
   }
+}
+
+/**
+ * Retry-After → миллисекунды.
+ *
+ * Сервер отдаёт его вместе с `503` (база занята другим писателем, issue #47) и
+ * тем самым называет конкретную паузу. Угадывать её своим backoff, когда есть
+ * прямое указание, — значит либо долбить раньше времени, либо ждать дольше нужного.
+ *
+ * Поддерживаем только числовую форму (секунды): HTTP-дату сервер не присылает,
+ * а разбирать её «на всякий случай» — код, который никто не проверит.
+ */
+function parseRetryAfter(headerValue) {
+  if (!headerValue) return null;
+  const seconds = Number(headerValue);
+  if (!Number.isFinite(seconds) || seconds < 0) return null;
+  return Math.min(seconds * 1000, 60000); // потолок минута: защита от абсурдных значений
 }
 
 /**
@@ -107,7 +126,12 @@ async function request(path, { method = 'GET', body } = {}) {
   if (!response.ok) {
     const fallback = `Ошибка ${response.status}`;
     const message = formatDetail(payload && payload.detail, fallback);
-    throw new ApiError(message, response.status, payload);
+    throw new ApiError(
+      message,
+      response.status,
+      payload,
+      parseRetryAfter(response.headers.get('Retry-After')),
+    );
   }
 
   // Прикладываем счётчик к массивам: вызывающий код решает, что с ним делать.
