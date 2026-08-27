@@ -29,11 +29,14 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
-def wait_ready(url: str, proc: subprocess.Popen, timeout: float = 25.0) -> None:
+def wait_ready(url: str, proc: subprocess.Popen, timeout: float = 30.0) -> None:
     """Ждём, пока процесс начнёт отвечать.
 
     Если процесс умер, не досиживаем таймаут — падаем сразу. Иначе отсутствующий
-    serve.py превращается в 25 секунд молчания на каждый запуск.
+    serve.py превращается в 30 секунд молчания на каждый запуск.
+
+    30 с, а не 25: на холодном CI-раннере первый импорт FastAPI бывает дольше
+    (замечание Agent-1 в ревью PR #23; в его CI-джобе #19 стоит столько же).
     """
     deadline = time.time() + timeout
     last = "не начали опрашивать"
