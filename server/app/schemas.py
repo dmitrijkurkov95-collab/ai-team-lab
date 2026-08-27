@@ -151,6 +151,93 @@ class Card(BaseModel):
         return _serialize_ts(value)
 
 
+#: Версия формата обмена. Растёт, когда меняется структура файла.
+EXPORT_FORMAT_VERSION = 1
+
+
+class CommentExport(BaseModel):
+    """Комментарий внутри файла обмена."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: Optional[int] = None
+    text: str
+    created_at: Optional[str] = None
+
+    @field_validator("text")
+    @classmethod
+    def validate_text(cls, v: str) -> str:
+        trimmed = (v or "").strip()
+        if not trimmed:
+            raise ValueError("comment text must not be empty")
+        return trimmed
+
+
+class CardExport(BaseModel):
+    """Карточка внутри файла обмена.
+
+    Валидация та же, что у обычного POST: импорт не должен быть дырой,
+    через которую в базу попадает то, что API не принял бы.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: Optional[int] = None
+    title: str
+    description: str = ""
+    status: Status = Status.backlog
+    priority: Priority = Priority.normal
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    deadline: Optional[str] = None
+    comments: list[CommentExport] = Field(default_factory=list)
+
+    @field_validator("title")
+    @classmethod
+    def validate_title(cls, v: str) -> str:
+        return _clean_title(v)
+
+    @field_validator("description", mode="before")
+    @classmethod
+    def normalize_description(cls, v):
+        return "" if v is None else v
+
+    @field_validator("deadline", mode="before")
+    @classmethod
+    def validate_deadline(cls, v):
+        return _clean_deadline(v)
+
+
+class BoardImport(BaseModel):
+    """Файл обмена целиком.
+
+    Оба поля обязательные и **без значений по умолчанию** — это защита от
+    потери данных, а не формальность. Со значением по умолчанию поле перестаёт
+    быть обязательным: тело `{}` проходило валидацию, превращалось в
+    «замени доску на пустую» и молча стирало всё, отвечая `200 OK`
+    (найдено на ревью PR #45 — Agent-2 по `format_version`, лид по `cards`).
+
+    Пустая доска остаётся легальной, но только как явное `"cards": []`:
+    это осознанная команда, а не молчание.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    format_version: int
+    cards: list[CardExport]
+
+    @field_validator("format_version")
+    @classmethod
+    def validate_version(cls, v: int) -> int:
+        # Неизвестную версию не пытаемся угадать: структура могла измениться
+        # несовместимо, и «почти импортировалось» хуже честного отказа.
+        if v != EXPORT_FORMAT_VERSION:
+            raise ValueError(
+                f"unsupported format_version {v}, expected {EXPORT_FORMAT_VERSION}"
+            )
+        return v
+
+
 class CommentCreate(BaseModel):
     model_config = ConfigDict(extra="ignore")
 

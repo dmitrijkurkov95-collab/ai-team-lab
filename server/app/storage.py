@@ -356,6 +356,111 @@ class Storage:
             cur = conn.execute("DELETE FROM cards WHERE id = ?", (card_id,))
             return cur.rowcount > 0
 
+    # ---------- экспорт / импорт ----------
+
+    def export_board(self) -> dict[str, Any]:
+        """Вся доска одним снимком: карточки со своими комментариями."""
+        with self._connect() as conn:
+            cards = [dict(r) for r in conn.execute("SELECT * FROM cards ORDER BY id ASC")]
+            comments = [
+                dict(r)
+                for r in conn.execute("SELECT * FROM comments ORDER BY card_id ASC, id ASC")
+            ]
+        by_card: dict[int, list[dict[str, Any]]] = {}
+        for comment in comments:
+            by_card.setdefault(comment["card_id"], []).append(comment)
+        for card in cards:
+            card["comments"] = by_card.get(card["id"], [])
+        return {"cards": cards}
+
+    def replace_board(self, cards: list[dict[str, Any]]) -> int:
+        """Заменяет доску целиком, сохраняя id из файла.
+
+        Всё в одной транзакции: битый файл не должен оставить половину доски.
+        `_connect` откатывает при исключении, поэтому при ошибке база остаётся
+        ровно такой, какой была до импорта.
+        """
+        with self._connect() as conn:
+            conn.execute("DELETE FROM comments")
+            conn.execute("DELETE FROM cards")
+            for card in cards:
+                conn.execute(
+                    "INSERT INTO cards (id, title, description, status, priority,"
+                    " created_at, updated_at, deadline) VALUES (?,?,?,?,?,?,?,?)",
+                    (
+                        card["id"],
+                        card["title"],
+                        card["description"],
+                        card["status"],
+                        card["priority"],
+                        card["created_at"],
+                        card["updated_at"],
+                        card.get("deadline"),
+                    ),
+                )
+                for comment in card.get("comments", []):
+                    conn.execute(
+                        "INSERT INTO comments (id, card_id, text, created_at) VALUES (?,?,?,?)",
+                        (comment["id"], card["id"], comment["text"], comment["created_at"]),
+                    )
+            # AUTOINCREMENT продолжит с максимума — иначе следующая созданная
+            # карточка получила бы id, уже занятый импортированной.
+            self._reset_autoincrement(conn)
+        return len(cards)
+
+    def merge_board(self, cards: list[dict[str, Any]]) -> int:
+        """Добавляет карточки к существующим, выдавая им новые id.
+
+        Id из файла сознательно не сохраняются: в непустой базе они почти
+        наверняка заняты, а молча перезаписать чужую карточку с тем же
+        номером — худшее, что может сделать импорт.
+        """
+        with self._connect() as conn:
+            for card in cards:
+                cur = conn.execute(
+                    "INSERT INTO cards (title, description, status, priority,"
+                    " created_at, updated_at, deadline) VALUES (?,?,?,?,?,?,?)",
+                    (
+                        card["title"],
+                        card["description"],
+                        card["status"],
+                        card["priority"],
+                        card["created_at"],
+                        card["updated_at"],
+                        card.get("deadline"),
+                    ),
+                )
+                new_id = cur.lastrowid
+                for comment in card.get("comments", []):
+                    conn.execute(
+                        "INSERT INTO comments (card_id, text, created_at) VALUES (?,?,?)",
+                        (new_id, comment["text"], comment["created_at"]),
+                    )
+        return len(cards)
+
+    @staticmethod
+    def _reset_autoincrement(conn: sqlite3.Connection) -> None:
+        """Двигает счётчик AUTOINCREMENT к максимальному занятому id.
+
+        Иначе следующая созданная карточка получила бы id, уже занятый
+        импортированной, и вставка упала бы на UNIQUE.
+
+        `sqlite_sequence` — служебная таблица без UNIQUE-ограничения на `name`,
+        поэтому `ON CONFLICT` к ней неприменим (ловил `OperationalError`):
+        пробуем UPDATE, и только если строки для таблицы ещё нет — INSERT.
+        Строка появляется лишь после первой вставки в таблицу с AUTOINCREMENT.
+        """
+        for table in ("cards", "comments"):
+            row = conn.execute(f"SELECT COALESCE(MAX(id), 0) AS m FROM {table}").fetchone()
+            highest = row["m"]
+            updated = conn.execute(
+                "UPDATE sqlite_sequence SET seq = ? WHERE name = ?", (highest, table)
+            ).rowcount
+            if not updated:
+                conn.execute(
+                    "INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)", (table, highest)
+                )
+
     # ---------- комментарии ----------
 
     def list_comments(self, card_id: int) -> list[dict[str, Any]]:

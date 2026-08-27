@@ -17,6 +17,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from .schemas import (
+    EXPORT_FORMAT_VERSION,
+    BoardImport,
     Card,
     CardCreate,
     CardUpdate,
@@ -25,7 +27,7 @@ from .schemas import (
     Priority,
     Status,
 )
-from .storage import DEFAULT_DB, Storage, StorageBusy
+from .storage import DEFAULT_DB, Storage, StorageBusy, utcnow
 
 API_PREFIX = "/api/v1"
 
@@ -266,6 +268,95 @@ def delete_card(card_id: int, store: Storage = Depends(get_storage)) -> Response
     if not store.delete_card(card_id):
         raise HTTPException(status_code=404, detail=f"Card {card_id} not found")
     return Response(status_code=http_status.HTTP_204_NO_CONTENT)
+
+
+# --------------------------------------------------------- экспорт / импорт
+
+
+@app.get(f"{API_PREFIX}/export", tags=["exchange"])
+def export_board(store: Storage = Depends(get_storage)) -> dict:
+    """Вся доска одним JSON: карточки со своими комментариями.
+
+    Отдаём телом, а не файлом с Content-Disposition: так удобнее curl и фронту,
+    а «скачать как файл» интерфейс сделает сам из этого же ответа.
+    """
+    board = store.export_board()
+    board["format_version"] = EXPORT_FORMAT_VERSION
+    board["exported_at"] = utcnow()
+    return board
+
+
+@app.post(f"{API_PREFIX}/import", tags=["exchange"])
+def import_board(
+    payload: BoardImport,
+    mode: Literal["replace", "merge"] = Query(
+        ...,
+        description="replace — заменить доску целиком (id сохраняются); merge — добавить к текущей",
+    ),
+    store: Storage = Depends(get_storage),
+) -> dict:
+    """Загружает доску из файла обмена.
+
+    `mode` **обязателен**: стирание доски не должно быть тем, что происходит,
+    когда параметр забыли указать. Дефолта нет сознательно — по итогам ревью
+    PR #45, где оба ревьюера независимо указали на опасность `replace`
+    по умолчанию.
+
+    `replace` заменяет доску целиком и сохраняет id: перенос и восстановление
+    из бэкапа должны давать ту же доску, а не похожую. `merge` дописывает
+    карточки с новыми id — молча перезаписать чужую карточку с совпавшим
+    номером хуже, чем выдать новый.
+
+    Импорт атомарный: при ошибке база остаётся в исходном состоянии.
+    """
+    cards = [card.model_dump() for card in payload.cards]
+
+    if mode == "replace":
+        # Дубли id внутри самого файла ловим до записи: иначе UNIQUE-нарушение
+        # прилетело бы из SQLite пятисотым, а это ошибка данных, то есть 422.
+        ids = [c["id"] for c in cards if c["id"] is not None]
+        duplicates = {i for i in ids if ids.count(i) > 1}
+        if duplicates:
+            raise HTTPException(
+                status_code=422,
+                detail=f"duplicate card ids in file: {sorted(duplicates)}",
+            )
+        now = utcnow()
+        next_id = (max(ids) if ids else 0) + 1
+        for card in cards:
+            if card["id"] is None:  # карточка без id — допустимо, выдаём свой
+                card["id"] = next_id
+                next_id += 1
+            card["created_at"] = card.get("created_at") or now
+            card["updated_at"] = card.get("updated_at") or now
+            comment_id = 1
+            for comment in card["comments"]:
+                if comment["id"] is None:
+                    comment["id"] = comment_id
+                comment_id = max(comment_id, comment["id"]) + 1
+                comment["created_at"] = comment.get("created_at") or now
+        # Комментарии нумеруются сквозным счётчиком по всей доске: id уникален
+        # в таблице целиком, а не внутри карточки.
+        seen: set[int] = set()
+        free = 1
+        for card in cards:
+            for comment in card["comments"]:
+                if comment["id"] in seen:
+                    while free in seen:
+                        free += 1
+                    comment["id"] = free
+                seen.add(comment["id"])
+        imported = store.replace_board(cards)
+    else:
+        now = utcnow()
+        for card in cards:
+            card["created_at"] = card.get("created_at") or now
+            card["updated_at"] = card.get("updated_at") or now
+            for comment in card["comments"]:
+                comment["created_at"] = comment.get("created_at") or now
+        imported = store.merge_board(cards)
+
+    return {"mode": mode, "imported_cards": imported, "total_cards": store.count_cards()}
 
 
 # ------------------------------------------------------------- комментарии
