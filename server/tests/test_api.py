@@ -710,3 +710,183 @@ def test_search_with_offset_beyond_matches_is_empty(client):
     make_card(client, title="Единственное совпадение")
     r = client.get(f"{API}/cards", params={"q": "совпадение", "offset": 10})
     assert r.status_code == 200 and r.json() == [] and r.headers["X-Total-Count"] == "1"
+
+
+# ------------------------------------------------- дедлайны и сортировка (#31)
+
+
+def test_card_has_null_deadline_by_default(client):
+    assert make_card(client, title="без срока")["deadline"] is None
+
+
+def test_create_card_with_deadline(client):
+    card = make_card(client, title="со сроком", deadline="2026-09-01T18:00:00Z")
+    assert card["deadline"] == "2026-09-01T18:00:00Z"
+
+
+def test_deadline_in_the_past_is_allowed(client):
+    """Прошлое разрешено: просрочка — состояние задачи, а не ошибка ввода."""
+    card = make_card(client, title="просрочена", deadline="2020-01-01T00:00:00Z")
+    assert card["deadline"] == "2020-01-01T00:00:00Z"
+
+
+def test_deadline_with_offset_is_normalized_to_utc(client):
+    """+03:00 приводится к UTC, чтобы сортировка по строке совпадала с хронологией."""
+    card = make_card(client, title="мск", deadline="2026-09-01T21:00:00+03:00")
+    assert card["deadline"] == "2026-09-01T18:00:00Z"
+
+
+def test_deadline_without_timezone_treated_as_utc(client):
+    card = make_card(client, title="без зоны", deadline="2026-09-01T18:00:00")
+    assert card["deadline"] == "2026-09-01T18:00:00Z"
+
+
+@pytest.mark.parametrize("bad", ["вчера", "2026-13-45T00:00:00Z", "", "   ", 42])
+def test_invalid_deadline_is_422(client, bad):
+    r = client.post(f"{API}/cards", json={"title": "плохой срок", "deadline": bad})
+    assert r.status_code == 422 and isinstance(r.json()["detail"], str)
+
+
+def test_patch_sets_deadline(client):
+    card = make_card(client, title="задача")
+    r = client.patch(f"{API}/cards/{card['id']}", json={"deadline": "2026-10-05T09:30:00Z"})
+    assert r.status_code == 200 and r.json()["deadline"] == "2026-10-05T09:30:00Z"
+
+
+def test_patch_null_clears_deadline(client):
+    """`{"deadline": null}` — это «снять срок», а не «поле не передано»."""
+    card = make_card(client, title="задача", deadline="2026-10-05T09:30:00Z")
+    r = client.patch(f"{API}/cards/{card['id']}", json={"deadline": None})
+    assert r.status_code == 200 and r.json()["deadline"] is None
+
+
+def test_patch_without_deadline_keeps_it(client):
+    card = make_card(client, title="задача", deadline="2026-10-05T09:30:00Z")
+    r = client.patch(f"{API}/cards/{card['id']}", json={"title": "новое имя"})
+    assert r.json()["deadline"] == "2026-10-05T09:30:00Z"
+
+
+def test_default_sort_is_id_asc(client):
+    """Без ?sort= порядок прежний — доска, не знающая про сортировку, не ломается."""
+    for i in range(4):
+        make_card(client, title=f"карточка {i}")
+    ids = [c["id"] for c in client.get(f"{API}/cards").json()]
+    assert ids == sorted(ids)
+
+
+def test_sort_by_priority_is_semantic_not_alphabetical(client):
+    """high > normal > low. По алфавиту было бы high, low, normal — бессмыслица."""
+    make_card(client, title="низкий", priority="low")
+    make_card(client, title="высокий", priority="high")
+    make_card(client, title="обычный", priority="normal")
+    got = client.get(f"{API}/cards", params={"sort": "priority", "order": "desc"}).json()
+    assert [c["priority"] for c in got] == ["high", "normal", "low"]
+
+
+def test_sort_by_deadline_asc(client):
+    make_card(client, title="поздняя", deadline="2026-12-01T00:00:00Z")
+    make_card(client, title="ранняя", deadline="2026-09-01T00:00:00Z")
+    got = client.get(f"{API}/cards", params={"sort": "deadline"}).json()
+    assert [c["title"] for c in got] == ["ранняя", "поздняя"]
+
+
+def test_cards_without_deadline_go_last_asc(client):
+    make_card(client, title="без срока")
+    make_card(client, title="со сроком", deadline="2026-09-01T00:00:00Z")
+    got = client.get(f"{API}/cards", params={"sort": "deadline"}).json()
+    assert [c["title"] for c in got] == ["со сроком", "без срока"]
+
+
+def test_cards_without_deadline_go_last_desc_too(client):
+    """«Срока нет» — не «срок бесконечно ранний»: пустой хвост всегда в конце."""
+    make_card(client, title="без срока")
+    make_card(client, title="со сроком", deadline="2026-09-01T00:00:00Z")
+    got = client.get(f"{API}/cards", params={"sort": "deadline", "order": "desc"}).json()
+    assert [c["title"] for c in got] == ["со сроком", "без срока"]
+
+
+def test_half_the_board_without_deadline(client):
+    """Граничный случай из Issue: дедлайн есть у половины карточек."""
+    for i in range(3):
+        make_card(client, title=f"со сроком {i}", deadline=f"2026-09-0{i + 1}T00:00:00Z")
+    for i in range(3):
+        make_card(client, title=f"без срока {i}")
+    got = client.get(f"{API}/cards", params={"sort": "deadline"}).json()
+    with_deadline = [c for c in got if c["deadline"]]
+    without = [c for c in got if not c["deadline"]]
+    assert len(with_deadline) == 3 and len(without) == 3
+    assert got[:3] == with_deadline, "карточки со сроком должны идти первыми"
+    assert [c["id"] for c in without] == sorted(c["id"] for c in without), "тай-брейк по id"
+
+
+def test_ties_broken_by_id_stably(client):
+    """При равных ключах порядок стабилен — иначе страницы пагинации поедут."""
+    for i in range(5):
+        make_card(client, title=f"одинаковый приоритет {i}", priority="normal")
+    first = [c["id"] for c in client.get(f"{API}/cards", params={"sort": "priority"}).json()]
+    second = [c["id"] for c in client.get(f"{API}/cards", params={"sort": "priority"}).json()]
+    assert first == second == sorted(first)
+
+
+def test_sort_combines_with_pagination(client):
+    for i in range(6):
+        make_card(client, title=f"задача {i}", deadline=f"2026-09-0{i + 1}T00:00:00Z")
+    page = client.get(
+        f"{API}/cards", params={"sort": "deadline", "order": "desc", "limit": 2, "offset": 0}
+    ).json()
+    assert [c["title"] for c in page] == ["задача 5", "задача 4"]
+
+
+def test_sort_combines_with_search_and_filters(client):
+    make_card(client, title="Дизайн поздний", priority="high", deadline="2026-12-01T00:00:00Z")
+    make_card(client, title="Дизайн ранний", priority="high", deadline="2026-09-01T00:00:00Z")
+    make_card(client, title="Мимо", deadline="2026-01-01T00:00:00Z")
+    got = client.get(
+        f"{API}/cards", params={"q": "дизайн", "priority": "high", "sort": "deadline"}
+    ).json()
+    assert [c["title"] for c in got] == ["Дизайн ранний", "Дизайн поздний"]
+
+
+@pytest.mark.parametrize("bad", ["title", "id", "deadline; DROP TABLE cards", ""])
+def test_invalid_sort_is_422(client, bad):
+    """Имя поля из запроса не должно доезжать до SQL — только из белого списка."""
+    assert client.get(f"{API}/cards", params={"sort": bad}).status_code == 422
+
+
+@pytest.mark.parametrize("bad", ["ascending", "up", ""])
+def test_invalid_order_is_422(client, bad):
+    assert client.get(f"{API}/cards", params={"order": bad}).status_code == 422
+
+
+def test_sort_by_created(client):
+    make_card(client, title="первая")
+    make_card(client, title="вторая")
+    got = client.get(f"{API}/cards", params={"sort": "created", "order": "desc"}).json()
+    assert got[0]["title"] == "вторая"
+
+
+def test_existing_database_gets_deadline_column(tmp_path):
+    """Миграция: у старой базы без колонки deadline сервер не должен падать."""
+    import sqlite3
+
+    db = tmp_path / "legacy.db"
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE TABLE cards (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'backlog', priority TEXT NOT NULL DEFAULT 'normal',
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        INSERT INTO cards (title, created_at, updated_at)
+        VALUES ('старая карточка', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = Storage(str(db))
+    cards = store.list_cards()
+    assert len(cards) == 1 and cards[0]["deadline"] is None
+    store.close()
