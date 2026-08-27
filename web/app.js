@@ -4,6 +4,7 @@
  */
 import api, { ApiError, BASE_URL } from './api.js';
 import { SyncQueue, OpOutcome } from './sync.js';
+import { BoardPoller, formatAge, POLL_INTERVAL_MS } from './poll.js';
 
 const COLUMNS = [
   { status: 'backlog', label: 'Бэклог' },
@@ -333,6 +334,92 @@ async function loadBoard() {
   }
 }
 
+// ------------------------------------------------------- фоновое обновление
+
+/**
+ * Тихий опрос: подтягивает чужие правки, не мешая работе.
+ *
+ * Два правила, которые делают его безопасным:
+ *
+ *  1. **Очередь главнее сервера.** Карточку с неотправленной правкой серверным
+ *     состоянием НЕ перезаписываем: пользователь уже перетащил её, показать
+ *     старую колонку — значит соврать и, возможно, спровоцировать повторное
+ *     действие. Остальные карточки обновляются штатно.
+ *  2. **Ошибка не обнуляет доску.** В отличие от `loadBoard`, неудачный опрос
+ *     оставляет последние известные данные и лишь помечает их несвежими —
+ *     мигание пустой доской из-за одного таймаута недопустимо.
+ */
+async function refreshTick() {
+  const fresh = await api.listCards(null, LOAD_LIMIT ? { limit: LOAD_LIMIT } : {});
+
+  // id карточек, по которым есть неотправленные правки — их не трогаем.
+  const locked = new Set(queue.pending.map((op) => op.cardId));
+  const byId = new Map(state.cards.map((c) => [c.id, c]));
+
+  const merged = fresh.map((remote) => {
+    if (!locked.has(remote.id)) return remote;
+    const local = byId.get(remote.id);
+    return local ? { ...remote, status: local.status } : remote;
+  });
+
+  // Карточки с локальными правками, которых уже нет на сервере, оставляем:
+  // их судьбу решит очередь (исход `gone`), а не фоновый опрос.
+  for (const id of locked) {
+    if (!merged.some((c) => c.id === id)) {
+      const local = byId.get(id);
+      if (local) merged.push(local);
+    }
+  }
+  merged.sort((a, b) => a.id - b.id);
+
+  const changed = hasBoardChanged(state.cards, merged);
+  state.cards = merged;
+  state.cards.totalCount = fresh.totalCount;
+  if (changed) {
+    render();
+    loadCommentCounts();
+  }
+  renderFreshness();
+}
+
+/** Сравнение по видимым полям: перерисовывать доску без причины незачем. */
+function hasBoardChanged(before, after) {
+  if (before.length !== after.length) return true;
+  const prev = new Map(before.map((c) => [c.id, c]));
+  return after.some((card) => {
+    const old = prev.get(card.id);
+    return (
+      !old ||
+      old.status !== card.status ||
+      old.title !== card.title ||
+      old.priority !== card.priority ||
+      old.updated_at !== card.updated_at
+    );
+  });
+}
+
+const poller = new BoardPoller(refreshTick, () => renderFreshness());
+
+/** Индикатор свежести: когда доска последний раз совпадала с сервером. */
+function renderFreshness() {
+  const box = $('freshness');
+  if (!box) return;
+  const { lastSuccessAt, failures } = poller;
+  box.dataset.state = poller.state;
+
+  if (failures) {
+    const age = lastSuccessAt ? formatAge(Date.now() - lastSuccessAt) : 'неизвестно когда';
+    box.textContent = `нет связи · данные от ${age}`;
+    box.title =
+      'Обновление не проходит. Показаны последние известные данные; ' +
+      'ваши правки не потеряны — они в очереди.';
+    return;
+  }
+  const age = lastSuccessAt ? formatAge(Date.now() - lastSuccessAt) : '—';
+  box.textContent = `обновлено ${age}`;
+  box.title = `Доска сама обновляется каждые ${Math.round(POLL_INTERVAL_MS / 1000)} с`;
+}
+
 /** Счётчики комментариев — украшение, поэтому их сбои не тревожим пользователя. */
 async function loadCommentCounts() {
   const results = await Promise.allSettled(
@@ -608,7 +695,17 @@ window.addEventListener('beforeunload', (e) => {
 });
 
 renderSyncIndicator({ state: 'synced', size: 0, lastError: null });
-loadBoard();
+loadBoard().then(() => {
+  // Первая загрузка уже показала актуальные данные — считаем их свежими,
+  // иначе индикатор соврёт «нет данных» до первого тика.
+  poller.lastSuccessAt = Date.now();
+  poller.start();
+  renderFreshness();
+});
+
+// Секундная стрелка индикатора: без неё «обновлено 3 с назад» застывает
+// на десять секунд и выглядит враньём.
+setInterval(renderFreshness, 1000);
 
 // Для тестов: доступ к очереди из браузерного контекста.
-window.__kanban = { queue, state };
+window.__kanban = { queue, state, poller };

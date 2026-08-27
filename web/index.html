@@ -67,6 +67,20 @@
 
   .status-line { font-size: 13px; color: var(--muted); }
 
+  /* Свежесть данных: спокойная подпись, тревожная — только при потере связи. */
+  .freshness {
+    font-size: 12px;
+    color: var(--muted);
+    padding: 3px 8px;
+    border-radius: 10px;
+    white-space: nowrap;
+  }
+  .freshness[data-state="stale"] {
+    background: #fffae6;
+    color: #974f0c;
+    font-weight: 600;
+  }
+
   /* --- индикатор синхронизации: заметный, но не навязчивый --- */
   .sync {
     display: flex;
@@ -256,6 +270,7 @@
     <span id="sync-label">всё сохранено</span>
     <button class="ghost" id="btn-retry" hidden>Повторить</button>
   </div>
+  <span class="freshness" id="freshness" data-state="live" title="Доска обновляется сама">—</span>
   <span class="status-line" id="status-line">загрузка…</span>
 </header>
 
