@@ -64,6 +64,8 @@ export class SyncQueue {
     this.timer = null;
     this.attempt = 0;
     this.lastError = null;
+    /** Пауза, назначенная сервером через Retry-After (мс), если он её назвал. */
+    this.retryAfterMs = null;
     this.seq = 0;
   }
 
@@ -169,7 +171,11 @@ export class SyncQueue {
         const isServer = status !== null && status >= 500;
         if (isNetwork || isServer) {
           // Сеть или сервер лежит — ждём и пробуем снова, операцию не теряем.
+          // 503 с Retry-After — не поломка, а «занято»: сервер сам называет
+          // паузу (очередь писателей SQLite, issue #47). Своим backoff в этом
+          // случае не гадаем.
           this.lastError = error;
+          this.retryAfterMs = error && error.retryAfterMs ? error.retryAfterMs : null;
           networkFailure = true;
           break;
         }
@@ -193,11 +199,13 @@ export class SyncQueue {
 
     this.flushing = false;
     if (networkFailure && this.pending.length) {
-      const delay = this.currentBackoff();
+      // Указание сервера (Retry-After) важнее нашей догадки.
+      const delay = this.retryAfterMs || this.currentBackoff();
       this.attempt += 1;
       this.schedule(delay);
     } else {
       this.attempt = 0;
+      this.retryAfterMs = null;
     }
     this.notify();
   }
