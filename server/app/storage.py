@@ -50,6 +50,22 @@ SEED_CARDS = [
 TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 
+def _ulower(value: Optional[str]) -> Optional[str]:
+    """Unicode-совместимый lower() для SQLite (см. create_function в _connect)."""
+    return value.lower() if isinstance(value, str) else value
+
+
+def _escape_like(term: str) -> str:
+    """Экранирует спецсимволы LIKE, чтобы поиск '100%' не стал маской.
+
+    Без этого `%` и `_` в пользовательском запросе означали бы «любой текст»
+    и «любой символ»: поиск по «100%» находил бы всё подряд.
+    """
+    for ch in ("\\", "%", "_"):
+        term = term.replace(ch, "\\" + ch)
+    return term
+
+
 def utcnow() -> str:
     """Текущее время в формате меток контракта.
 
@@ -105,6 +121,10 @@ class Storage:
         conn.row_factory = sqlite3.Row
         try:
             conn.execute("PRAGMA foreign_keys = ON")  # каскад удаления комментариев
+            # Встроенный LIKE в SQLite регистронезависим ТОЛЬКО для ASCII:
+            # 'Карточка' LIKE '%карточка%' → 0 совпадений, а доска у нас русская.
+            # Отдаём приведение регистра Python — он знает Unicode.
+            conn.create_function("ulower", 1, _ulower, deterministic=True)
             yield conn
             conn.commit()
         except Exception:
@@ -144,6 +164,7 @@ class Storage:
         priority: Optional[str] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
+        q: Optional[str] = None,
     ) -> list[dict[str, Any]]:
         """Список карточек с опциональными фильтрами.
 
@@ -153,18 +174,13 @@ class Storage:
         `offset` пропускает первые N строк той же отсортированной выборки.
         SQLite не принимает OFFSET без LIMIT, поэтому при `offset` без `limit`
         подставляем `LIMIT -1` — документированный способ сказать «без предела».
+
+        `q` — поиск подстроки в title и description, регистронезависимый
+        и для кириллицы (через ulower, см. _connect).
         """
         sql = "SELECT * FROM cards"
-        conditions: list[str] = []
-        args: list[Any] = []
-        if status is not None:
-            conditions.append("status = ?")
-            args.append(status)
-        if priority is not None:
-            conditions.append("priority = ?")
-            args.append(priority)
-        if conditions:
-            sql += " WHERE " + " AND ".join(conditions)
+        where, args = self._filters(status, priority, q)
+        sql += where
         sql += " ORDER BY id ASC"  # контракт: по возрастанию id
         if limit is not None or offset:
             sql += " LIMIT ?"
@@ -175,9 +191,15 @@ class Storage:
         with self._connect() as conn:
             return [dict(r) for r in conn.execute(sql, args)]
 
-    def count_cards(self, status: Optional[str] = None, priority: Optional[str] = None) -> int:
-        """Сколько карточек попадает под фильтр — без учёта limit."""
-        sql = "SELECT COUNT(*) AS n FROM cards"
+    @staticmethod
+    def _filters(
+        status: Optional[str], priority: Optional[str], q: Optional[str] = None
+    ) -> tuple[str, list[Any]]:
+        """Собирает WHERE один раз для list_cards и count_cards.
+
+        Иначе X-Total-Count и сама выдача считались бы по разным условиям —
+        ровно тот класс расхождений, который доска показывает как «неполная».
+        """
         conditions: list[str] = []
         args: list[Any] = []
         if status is not None:
@@ -186,8 +208,22 @@ class Storage:
         if priority is not None:
             conditions.append("priority = ?")
             args.append(priority)
-        if conditions:
-            sql += " WHERE " + " AND ".join(conditions)
+        if q:
+            conditions.append(
+                "(ulower(title) LIKE ulower(?) ESCAPE '\\'"
+                " OR ulower(description) LIKE ulower(?) ESCAPE '\\')"
+            )
+            pattern = f"%{_escape_like(q)}%"
+            args += [pattern, pattern]
+        return (" WHERE " + " AND ".join(conditions)) if conditions else "", args
+
+    def count_cards(
+        self, status: Optional[str] = None, priority: Optional[str] = None, q: Optional[str] = None
+    ) -> int:
+        """Сколько карточек попадает под фильтр — без учёта limit."""
+        sql = "SELECT COUNT(*) AS n FROM cards"
+        where, args = self._filters(status, priority, q)
+        sql += where
         with self._connect() as conn:
             return int(conn.execute(sql, args).fetchone()["n"])
 

@@ -138,6 +138,12 @@ def list_cards(
         ge=0,
         description="сколько карточек пропустить от начала выборки; без параметра — 0",
     ),
+    q: Optional[str] = Query(
+        default=None,
+        min_length=1,
+        max_length=200,
+        description="поиск подстроки в title и description, без учёта регистра",
+    ),
     store: Storage = Depends(get_storage),
 ) -> list[dict]:
     """Список карточек. Фильтры комбинируются, лимит применяется после сортировки.
@@ -156,10 +162,29 @@ def list_cards(
     """
     status_value = status.value if status else None
     priority_value = priority.value if priority else None
-    total = store.count_cards(status=status_value, priority=priority_value)
+    # Пробелы по краям режем: "?q= дизайн " и "?q=дизайн" — один и тот же запрос
+    # для пользователя, разные результаты стали бы сюрпризом. Запрос из одних
+    # пробелов после обрезки пуст — это 422 ниже, а не «фильтр, который не фильтрует».
+    q_value = q.strip() if q is not None else None
+    if q is not None and not q_value:
+        raise RequestValidationError(
+            [
+                {
+                    "type": "string_too_short",
+                    "loc": ("query", "q"),
+                    "msg": "search query must not be blank",
+                    "input": q,
+                }
+            ]
+        )
+    total = store.count_cards(status=status_value, priority=priority_value, q=q_value)
     response.headers["X-Total-Count"] = str(total)
     return store.list_cards(
-        status=status_value, priority=priority_value, limit=limit, offset=offset
+        status=status_value,
+        priority=priority_value,
+        limit=limit,
+        offset=offset,
+        q=q_value,
     )
 
 
